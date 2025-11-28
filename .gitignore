@@ -20,6 +20,8 @@ docker-compose.override.yml
 !app/**
 !tests/
 !tests/**
+!miniapp/
+!miniapp/**
 
 # Дополнительно разрешаем README и лицензию (опционально)
 !README.md
