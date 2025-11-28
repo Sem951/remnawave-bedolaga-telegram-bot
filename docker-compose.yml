@@ -82,6 +82,18 @@ services:
       retries: 3
       start_period: 30s
 
+  miniapp:
+    build: ./frontend
+    container_name: remnawave_miniapp
+    restart: unless-stopped
+    ports:
+      - "8081:80"
+    networks:
+      - bot_network
+    depends_on:
+      bot:
+        condition: service_healthy
+
 volumes:
   postgres_data:
     driver: local
