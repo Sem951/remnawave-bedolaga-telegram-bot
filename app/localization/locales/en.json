@@ -711,6 +711,10 @@
   "ADMIN_USERS_FILTERS": "⚙️ Filters",
   "ADMIN_USERS_FILTER_ACTIVITY": "🕒 By activity",
   "ADMIN_USERS_FILTER_BALANCE": "💰 By balance",
+  "ADMIN_USERS_FILTER_RENEW_READY": "♻️ Ready to renew",
+  "ADMIN_USERS_FILTER_RENEW_READY_TITLE": "♻️ Users ready to renew",
+  "ADMIN_USERS_FILTER_RENEW_READY_DESC": "Their subscription expired and the balance still has {amount} or more.",
+  "ADMIN_USERS_FILTER_RENEW_READY_EMPTY": "No users match this filter right now.",
   "ADMIN_USERS_FILTER_CAMPAIGN": "📢 By campaign",
   "ADMIN_USERS_FILTER_PURCHASES": "🛒 By purchases",
   "ADMIN_USERS_FILTER_SPENDING": "💳 By spending",
@@ -1087,6 +1091,8 @@
   "PAYMENT_METHOD_SUPPORT_NAME": "🛠️ <b>Support team</b>",
   "PAYMENT_METHOD_TRIBUTE_DESCRIPTION": "via Tribute",
   "PAYMENT_METHOD_TRIBUTE_NAME": "💳 <b>Bank card</b>",
+  "PAYMENT_METHOD_HELEKET_DESCRIPTION": "via Heleket",
+  "PAYMENT_METHOD_HELEKET_NAME": "🪙 <b>Cryptocurrency (Heleket)</b>",
   "PAYMENT_METHOD_YOOKASSA_DESCRIPTION": "via YooKassa",
   "PAYMENT_METHOD_YOOKASSA_NAME": "💳 <b>Bank card</b>",
   "PAYMENT_METHOD_YOOKASSA_SBP_DESCRIPTION": "via YooKassa Fast Payment System",
@@ -1284,7 +1290,7 @@
   "SUBSCRIPTION_CONNECT_DEVICE_MESSAGE_HIDDEN": "📱 <b>Connect subscription</b>\n\nℹ️ The subscription link is available via the buttons below or in the “My subscription” section.\n\n💡 <b>Choose your device</b> to get detailed setup instructions:",
   "SUBSCRIPTION_CONNECT_LINK_MESSAGE": "🚀 <b>Connect subscription</b>\n\n🔗 Tap the button below to open the subscription link:",
   "SUBSCRIPTION_CONNECT_LINK_PROMPT": "📱 Copy the link and add it to your VPN app",
-  "SUBSCRIPTION_CONNECT_LINK_SECTION": "🔗 <b>Connection link:</b>\n<code>{subscription_url}</code>",
+  "SUBSCRIPTION_CONNECT_LINK_SECTION": "🔗 <b>Connection link:</b>\n{subscription_url}",
   "SUBSCRIPTION_CONNECT_MINIAPP_MESSAGE": "📱 <b>Connect subscription</b>\n\n🚀 Tap the button below to open the subscription in the Telegram mini app:",
   "SUBSCRIPTION_DEVICE_APPS_NOT_FOUND": "❌ No apps found for this device",
   "SUBSCRIPTION_DEVICE_FEATURED_APP": "📋 <b>Recommended app:</b> {app_name}",
@@ -1526,5 +1532,7 @@
   "POLL_EMPTY": "Poll is not available yet.",
   "POLL_ERROR": "Unable to process the poll. Please try again later.",
   "POLL_COMPLETED": "🙏 Thanks for completing the poll!",
-  "POLL_REWARD_GRANTED": "Reward {amount} has been credited to your balance."
+  "POLL_REWARD_GRANTED": "Reward {amount} has been credited to your balance.",
+  "ADMIN_USERS_BULK_BAN": "🛑 Bulk Ban",
+  "ADMIN_USERS_BLACKLIST": "🔐 Blacklist"
 }

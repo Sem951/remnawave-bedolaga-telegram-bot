@@ -3,6 +3,7 @@ import logging
 import re
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timedelta
+from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from zoneinfo import ZoneInfo
@@ -44,6 +45,26 @@ from app.utils.subscription_utils import (
 from app.utils.timezone import get_local_timezone
 
 logger = logging.getLogger(__name__)
+
+
+def _get_user_traffic_bytes(panel_user: Dict[str, Any]) -> int:
+    """Извлекает usedTrafficBytes из панельного пользователя (совместимо с новым и старым API)"""
+    # Новый формат: userTraffic.usedTrafficBytes
+    user_traffic = panel_user.get('userTraffic')
+    if user_traffic and isinstance(user_traffic, dict):
+        return user_traffic.get('usedTrafficBytes', 0)
+    # Старый формат: usedTrafficBytes напрямую
+    return panel_user.get('usedTrafficBytes', 0)
+
+
+def _get_lifetime_traffic_bytes(panel_user: Dict[str, Any]) -> int:
+    """Извлекает lifetimeUsedTrafficBytes из панельного пользователя (совместимо с новым и старым API)"""
+    # Новый формат: userTraffic.lifetimeUsedTrafficBytes
+    user_traffic = panel_user.get('userTraffic')
+    if user_traffic and isinstance(user_traffic, dict):
+        return user_traffic.get('lifetimeUsedTrafficBytes', 0)
+    # Старый формат: lifetimeUsedTrafficBytes напрямую
+    return panel_user.get('lifetimeUsedTrafficBytes', 0)
 
 
 _UUID_MAP_MISSING = object()
@@ -760,7 +781,20 @@ class RemnaWaveService:
                     "is_xray_running": node.is_xray_running,
                     "users_online": node.users_online or 0,
                     "traffic_used_bytes": node.traffic_used_bytes or 0,
-                    "traffic_limit_bytes": node.traffic_limit_bytes or 0
+                    "traffic_limit_bytes": node.traffic_limit_bytes or 0,
+                    "last_status_change": node.last_status_change,
+                    "last_status_message": node.last_status_message,
+                    "xray_uptime": node.xray_uptime,
+                    "is_traffic_tracking_active": node.is_traffic_tracking_active,
+                    "traffic_reset_day": node.traffic_reset_day,
+                    "notify_percent": node.notify_percent,
+                    "consumption_multiplier": node.consumption_multiplier,
+                    "cpu_count": node.cpu_count,
+                    "cpu_model": node.cpu_model,
+                    "total_ram": node.total_ram,
+                    "created_at": node.created_at,
+                    "updated_at": node.updated_at,
+                    "provider_uuid": node.provider_uuid,
                 }
                 
         except Exception as e:
@@ -818,15 +852,19 @@ class RemnaWaveService:
         try:
             async with self.get_api_client() as api:
                 squads = await api.get_internal_squads()
-                
+
                 result = []
                 for squad in squads:
+                    inbounds = [
+                        asdict(inbound) if is_dataclass(inbound) else inbound
+                        for inbound in squad.inbounds or []
+                    ]
                     result.append({
                         'uuid': squad.uuid,
                         'name': squad.name,
                         'members_count': squad.members_count,
                         'inbounds_count': squad.inbounds_count,
-                        'inbounds': squad.inbounds
+                        'inbounds': inbounds,
                     })
                 
                 logger.info(f"✅ Получено {len(result)} сквадов из Remnawave")
@@ -1109,7 +1147,7 @@ class RemnaWaveService:
                 while True:
                     logger.info(f"📥 Загружаем пользователей: start={start}, size={size}")
                     
-                    response = await api.get_all_users(start=start, size=size)
+                    response = await api.get_all_users(start=start, size=size, enrich_happ_links=True)
                     users_batch = response['users']
                     total_users = response['total']
                     
@@ -1463,10 +1501,10 @@ class RemnaWaveService:
         
             traffic_limit_bytes = panel_user.get('trafficLimitBytes', 0)
             traffic_limit_gb = traffic_limit_bytes // (1024**3) if traffic_limit_bytes > 0 else 0
-        
-            used_traffic_bytes = panel_user.get('usedTrafficBytes', 0)
+
+            used_traffic_bytes = _get_user_traffic_bytes(panel_user)
             traffic_used_gb = used_traffic_bytes / (1024**3)
-        
+
             active_squads = panel_user.get('activeInternalSquads', [])
             squad_uuids = []
             if isinstance(active_squads, list):
@@ -1568,10 +1606,10 @@ class RemnaWaveService:
             if subscription.status != new_status:
                 subscription.status = new_status
                 logger.debug(f"Обновлен статус подписки: {new_status}")
-        
-            used_traffic_bytes = panel_user.get('usedTrafficBytes', 0)
+
+            used_traffic_bytes = _get_user_traffic_bytes(panel_user)
             traffic_used_gb = used_traffic_bytes / (1024**3)
-        
+
             if abs(subscription.traffic_used_gb - traffic_used_gb) > 0.01:
                 subscription.traffic_used_gb = traffic_used_gb
                 logger.debug(f"Обновлен использованный трафик: {traffic_used_gb} GB")
@@ -1827,12 +1865,16 @@ class RemnaWaveService:
             async with self.get_api_client() as api:
                 squad = await api.get_internal_squad_by_uuid(squad_uuid)
                 if squad:
+                    inbounds = [
+                        asdict(inbound) if is_dataclass(inbound) else inbound
+                        for inbound in squad.inbounds or []
+                    ]
                     return {
                         'uuid': squad.uuid,
                         'name': squad.name,
                         'members_count': squad.members_count,
                         'inbounds_count': squad.inbounds_count,
-                        'inbounds': squad.inbounds
+                        'inbounds': inbounds
                     }
                 return None
         except Exception as e:
@@ -2565,5 +2607,3 @@ class RemnaWaveService:
             "api_url": settings.REMNAWAVE_API_URL,
             "attempts_used": attempts,
         }
-        
-
