@@ -10,6 +10,7 @@ from aiogram.exceptions import TelegramBadRequest
 from app.config import settings
 from app.database.database import get_db
 from app.services.monitoring_service import monitoring_service
+from app.services.nalogo_queue_service import nalogo_queue_service
 from app.utils.decorators import admin_required
 from app.utils.pagination import paginate_list
 from app.keyboards.admin import get_monitoring_keyboard, get_admin_main_keyboard
@@ -911,18 +912,662 @@ async def monitoring_statistics_callback(callback: CallbackQuery):
 • Уведомления: {'🟢 Вкл' if getattr(settings, 'ENABLE_NOTIFICATIONS', True) else '🔴 Выкл'}
 • Автооплата: {', '.join(map(str, settings.get_autopay_warning_days()))} дней
 """
-            
+
+            # Добавляем информацию о чеках NaloGO
+            if settings.is_nalogo_enabled():
+                nalogo_status = await nalogo_queue_service.get_status()
+                queue_len = nalogo_status.get("queue_length", 0)
+                total_amount = nalogo_status.get("total_amount", 0)
+                running = nalogo_status.get("running", False)
+                pending_count = nalogo_status.get("pending_verification_count", 0)
+                pending_amount = nalogo_status.get("pending_verification_amount", 0)
+
+                nalogo_section = f"""
+🧾 <b>Чеки NaloGO:</b>
+• Сервис: {'🟢 Работает' if running else '🔴 Остановлен'}
+• В очереди: {queue_len} чек(ов)"""
+                if queue_len > 0:
+                    nalogo_section += f"\n• На сумму: {total_amount:,.2f} ₽"
+                if pending_count > 0:
+                    nalogo_section += f"\n⚠️ <b>Требуют проверки: {pending_count} ({pending_amount:,.2f} ₽)</b>"
+                text += nalogo_section
+
             from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_monitoring")]
-            ])
-            
+
+            buttons = []
+            # Кнопки для работы с чеками NaloGO
+            if settings.is_nalogo_enabled():
+                nalogo_status = await nalogo_queue_service.get_status()
+                nalogo_buttons = []
+                if nalogo_status.get("queue_length", 0) > 0:
+                    nalogo_buttons.append(InlineKeyboardButton(
+                        text=f"🧾 Отправить ({nalogo_status['queue_length']})",
+                        callback_data="admin_mon_nalogo_force_process"
+                    ))
+                pending_count = nalogo_status.get("pending_verification_count", 0)
+                if pending_count > 0:
+                    nalogo_buttons.append(InlineKeyboardButton(
+                        text=f"⚠️ Проверить ({pending_count})",
+                        callback_data="admin_mon_nalogo_pending"
+                    ))
+                nalogo_buttons.append(InlineKeyboardButton(
+                    text="📊 Сверка чеков",
+                    callback_data="admin_mon_receipts_missing"
+                ))
+                buttons.append(nalogo_buttons)
+
+            buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_monitoring")])
+            keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
             await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
             break
             
     except Exception as e:
         logger.error(f"Ошибка получения статистики: {e}")
         await callback.answer(f"❌ Ошибка получения статистики: {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data == "admin_mon_nalogo_force_process")
+@admin_required
+async def nalogo_force_process_callback(callback: CallbackQuery):
+    """Принудительная отправка чеков из очереди."""
+    try:
+        await callback.answer("🔄 Запускаю обработку очереди чеков...", show_alert=False)
+
+        result = await nalogo_queue_service.force_process()
+
+        if "error" in result:
+            await callback.answer(f"❌ {result['error']}", show_alert=True)
+            return
+
+        message = result.get("message", "Готово")
+        processed = result.get("processed", 0)
+        remaining = result.get("remaining", 0)
+
+        if processed > 0:
+            text = f"✅ Обработано: {processed} чек(ов)"
+            if remaining > 0:
+                text += f"\n⏳ Осталось в очереди: {remaining}"
+        else:
+            if remaining > 0:
+                text = f"⚠️ Сервис nalog.ru недоступен\n⏳ В очереди: {remaining} чек(ов)"
+            else:
+                text = "📭 Очередь пуста"
+
+        await callback.answer(text, show_alert=True)
+
+        # Обновляем страницу статистики
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+        # Перезагружаем статистику
+        async for db in get_db():
+            from app.database.crud.subscription import get_subscriptions_statistics
+            sub_stats = await get_subscriptions_statistics(db)
+            mon_status = await monitoring_service.get_monitoring_status(db)
+
+            week_ago = datetime.now() - timedelta(days=7)
+            week_logs = await monitoring_service.get_monitoring_logs(db, limit=1000)
+            week_logs = [log for log in week_logs if log['created_at'] >= week_ago]
+            week_success = sum(1 for log in week_logs if log['is_success'])
+            week_errors = len(week_logs) - week_success
+
+            stats_text = f"""
+📊 <b>Статистика мониторинга</b>
+
+📱 <b>Подписки:</b>
+• Всего: {sub_stats['total_subscriptions']}
+• Активных: {sub_stats['active_subscriptions']}
+• Тестовых: {sub_stats['trial_subscriptions']}
+• Платных: {sub_stats['paid_subscriptions']}
+
+📈 <b>За сегодня:</b>
+• Успешных операций: {mon_status['stats_24h']['successful']}
+• Ошибок: {mon_status['stats_24h']['failed']}
+• Успешность: {mon_status['stats_24h']['success_rate']}%
+
+📊 <b>За неделю:</b>
+• Всего событий: {len(week_logs)}
+• Успешных: {week_success}
+• Ошибок: {week_errors}
+• Успешность: {round(week_success/len(week_logs)*100, 1) if week_logs else 0}%
+
+🔧 <b>Система:</b>
+• Интервал: {settings.MONITORING_INTERVAL} мин
+• Уведомления: {'🟢 Вкл' if getattr(settings, 'ENABLE_NOTIFICATIONS', True) else '🔴 Выкл'}
+• Автооплата: {', '.join(map(str, settings.get_autopay_warning_days()))} дней
+"""
+
+            if settings.is_nalogo_enabled():
+                nalogo_status = await nalogo_queue_service.get_status()
+                queue_len = nalogo_status.get("queue_length", 0)
+                total_amount = nalogo_status.get("total_amount", 0)
+                running = nalogo_status.get("running", False)
+
+                nalogo_section = f"""
+🧾 <b>Чеки NaloGO:</b>
+• Сервис: {'🟢 Работает' if running else '🔴 Остановлен'}
+• В очереди: {queue_len} чек(ов)"""
+                if queue_len > 0:
+                    nalogo_section += f"\n• На сумму: {total_amount:,.2f} ₽"
+                stats_text += nalogo_section
+
+            buttons = []
+            # Кнопки для работы с чеками NaloGO
+            if settings.is_nalogo_enabled():
+                nalogo_status = await nalogo_queue_service.get_status()
+                nalogo_buttons = []
+                if nalogo_status.get("queue_length", 0) > 0:
+                    nalogo_buttons.append(InlineKeyboardButton(
+                        text=f"🧾 Отправить ({nalogo_status['queue_length']})",
+                        callback_data="admin_mon_nalogo_force_process"
+                    ))
+                nalogo_buttons.append(InlineKeyboardButton(
+                    text="📊 Сверка чеков",
+                    callback_data="admin_mon_receipts_missing"
+                ))
+                buttons.append(nalogo_buttons)
+
+            buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_monitoring")])
+            keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+            await callback.message.edit_text(stats_text, parse_mode="HTML", reply_markup=keyboard)
+            break
+
+    except Exception as e:
+        logger.error(f"Ошибка принудительной обработки чеков: {e}")
+        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data == "admin_mon_nalogo_pending")
+@admin_required
+async def nalogo_pending_callback(callback: CallbackQuery):
+    """Просмотр чеков ожидающих ручной проверки."""
+    try:
+        from app.services.nalogo_service import NaloGoService
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+        nalogo_service = NaloGoService()
+        receipts = await nalogo_service.get_pending_verification_receipts()
+
+        if not receipts:
+            await callback.answer("✅ Нет чеков на проверку", show_alert=True)
+            return
+
+        text = f"⚠️ <b>Чеки требующие проверки: {len(receipts)}</b>\n\n"
+        text += "Проверьте в lknpd.nalog.ru созданы ли эти чеки.\n\n"
+
+        buttons = []
+        for i, receipt in enumerate(receipts[:10], 1):
+            payment_id = receipt.get("payment_id", "unknown")
+            amount = receipt.get("amount", 0)
+            created_at = receipt.get("created_at", "")[:16].replace("T", " ")
+            error = receipt.get("error", "")[:50]
+
+            text += f"<b>{i}. {amount:,.2f} ₽</b>\n"
+            text += f"   📅 {created_at}\n"
+            text += f"   🆔 <code>{payment_id[:20]}...</code>\n"
+            if error:
+                text += f"   ❌ {error}\n"
+            text += "\n"
+
+            # Кнопки для каждого чека
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"✅ Создан ({i})",
+                    callback_data=f"admin_nalogo_verified:{payment_id[:30]}"
+                ),
+                InlineKeyboardButton(
+                    text=f"🔄 Отправить ({i})",
+                    callback_data=f"admin_nalogo_retry:{payment_id[:30]}"
+                ),
+            ])
+
+        if len(receipts) > 10:
+            text += f"\n... и ещё {len(receipts) - 10} чек(ов)"
+
+        buttons.append([
+            InlineKeyboardButton(
+                text="🗑 Очистить всё (проверено)",
+                callback_data="admin_nalogo_clear_pending"
+            )
+        ])
+        buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_mon_statistics")])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+    except Exception as e:
+        logger.error(f"Ошибка просмотра очереди проверки: {e}")
+        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("admin_nalogo_verified:"))
+@admin_required
+async def nalogo_mark_verified_callback(callback: CallbackQuery):
+    """Пометить чек как созданный в налоговой."""
+    try:
+        from app.services.nalogo_service import NaloGoService
+
+        payment_id = callback.data.split(":", 1)[1]
+        nalogo_service = NaloGoService()
+
+        # Помечаем как проверенный (чек был создан)
+        removed = await nalogo_service.mark_pending_as_verified(
+            payment_id, receipt_uuid=None, was_created=True
+        )
+
+        if removed:
+            await callback.answer(f"✅ Чек помечен как созданный", show_alert=True)
+            # Обновляем список
+            await nalogo_pending_callback(callback)
+        else:
+            await callback.answer("❌ Чек не найден", show_alert=True)
+
+    except Exception as e:
+        logger.error(f"Ошибка пометки чека: {e}")
+        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("admin_nalogo_retry:"))
+@admin_required
+async def nalogo_retry_callback(callback: CallbackQuery):
+    """Повторно отправить чек в налоговую."""
+    try:
+        from app.services.nalogo_service import NaloGoService
+
+        payment_id = callback.data.split(":", 1)[1]
+        nalogo_service = NaloGoService()
+
+        await callback.answer("🔄 Отправляю чек...", show_alert=False)
+
+        receipt_uuid = await nalogo_service.retry_pending_receipt(payment_id)
+
+        if receipt_uuid:
+            await callback.answer(f"✅ Чек создан: {receipt_uuid}", show_alert=True)
+            # Обновляем список
+            await nalogo_pending_callback(callback)
+        else:
+            await callback.answer("❌ Не удалось создать чек", show_alert=True)
+
+    except Exception as e:
+        logger.error(f"Ошибка повторной отправки чека: {e}")
+        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data == "admin_nalogo_clear_pending")
+@admin_required
+async def nalogo_clear_pending_callback(callback: CallbackQuery):
+    """Очистить всю очередь проверки."""
+    try:
+        from app.services.nalogo_service import NaloGoService
+
+        nalogo_service = NaloGoService()
+        count = await nalogo_service.clear_pending_verification()
+
+        await callback.answer(f"✅ Очищено: {count} чек(ов)", show_alert=True)
+        # Возвращаемся на статистику
+        await callback.message.edit_text(
+            "✅ Очередь проверки очищена",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_mon_statistics")]
+            ])
+        )
+
+    except Exception as e:
+        logger.error(f"Ошибка очистки очереди: {e}")
+        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data == "admin_mon_receipts_missing")
+@admin_required
+async def receipts_missing_callback(callback: CallbackQuery):
+    """Сверка чеков по логам."""
+    # Напрямую вызываем сверку по логам
+    await _do_reconcile_logs(callback)
+
+
+@router.callback_query(F.data == "admin_mon_receipts_link_old")
+@admin_required
+async def receipts_link_old_callback(callback: CallbackQuery):
+    """Привязать старые чеки из NaloGO к транзакциям по сумме и дате."""
+    try:
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        from sqlalchemy import select, and_
+        from datetime import date, timedelta
+        from app.database.models import Transaction, PaymentMethod, TransactionType
+        from app.services.nalogo_service import NaloGoService
+
+        await callback.answer("🔄 Загружаю чеки из NaloGO...", show_alert=False)
+
+        TRACKING_START_DATE = datetime(2024, 12, 29, 0, 0, 0)
+
+        async for db in get_db():
+            # Получаем старые транзакции без чеков
+            query = select(Transaction).where(
+                and_(
+                    Transaction.type == TransactionType.DEPOSIT.value,
+                    Transaction.payment_method == PaymentMethod.YOOKASSA.value,
+                    Transaction.receipt_uuid.is_(None),
+                    Transaction.is_completed == True,
+                    Transaction.created_at < TRACKING_START_DATE,
+                )
+            ).order_by(Transaction.created_at.desc())
+
+            result = await db.execute(query)
+            transactions = result.scalars().all()
+
+            if not transactions:
+                await callback.answer("✅ Нет старых транзакций для привязки", show_alert=True)
+                return
+
+            # Получаем чеки из NaloGO за последние 60 дней
+            nalogo_service = NaloGoService()
+            to_date = date.today()
+            from_date = to_date - timedelta(days=60)
+
+            incomes = await nalogo_service.get_incomes(
+                from_date=from_date,
+                to_date=to_date,
+                limit=500,
+            )
+
+            if not incomes:
+                await callback.answer("❌ Не удалось получить чеки из NaloGO", show_alert=True)
+                return
+
+            # Создаём словарь чеков по сумме для быстрого поиска
+            # Ключ: сумма в копейках, значение: список чеков
+            incomes_by_amount = {}
+            for income in incomes:
+                amount = float(income.get("totalAmount", income.get("amount", 0)))
+                amount_kopeks = int(amount * 100)
+                if amount_kopeks not in incomes_by_amount:
+                    incomes_by_amount[amount_kopeks] = []
+                incomes_by_amount[amount_kopeks].append(income)
+
+            linked = 0
+            for t in transactions:
+                if t.amount_kopeks in incomes_by_amount:
+                    matching_incomes = incomes_by_amount[t.amount_kopeks]
+                    if matching_incomes:
+                        # Берём первый подходящий чек
+                        income = matching_incomes.pop(0)
+                        receipt_uuid = income.get("approvedReceiptUuid", income.get("receiptUuid"))
+                        if receipt_uuid:
+                            t.receipt_uuid = receipt_uuid
+                            # Парсим дату чека
+                            operation_time = income.get("operationTime")
+                            if operation_time:
+                                try:
+                                    from dateutil.parser import isoparse
+                                    t.receipt_created_at = isoparse(operation_time)
+                                except Exception:
+                                    t.receipt_created_at = datetime.utcnow()
+                            linked += 1
+
+            if linked > 0:
+                await db.commit()
+
+            text = f"🔗 <b>Привязка завершена</b>\n\n"
+            text += f"Всего транзакций: {len(transactions)}\n"
+            text += f"Чеков в NaloGO: {len(incomes)}\n"
+            text += f"Привязано: <b>{linked}</b>\n"
+            text += f"Не удалось привязать: {len(transactions) - linked}"
+
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_mon_statistics")],
+            ])
+
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+            break
+
+    except Exception as e:
+        logger.error(f"Ошибка привязки старых чеков: {e}", exc_info=True)
+        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data == "admin_mon_receipts_reconcile")
+@admin_required
+async def receipts_reconcile_menu_callback(callback: CallbackQuery, state: FSMContext):
+    """Меню выбора периода сверки."""
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+    # Очищаем состояние на случай если остался ввод даты
+    await state.clear()
+
+    # Сразу показываем сверку по логам
+    await _do_reconcile_logs(callback)
+
+
+async def _do_reconcile_logs(callback: CallbackQuery):
+    """Внутренняя функция сверки по логам."""
+    try:
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        from pathlib import Path
+        import re
+        from collections import defaultdict
+
+        await callback.answer("🔄 Анализирую логи платежей...", show_alert=False)
+
+        # Путь к файлу логов платежей (logs/current/)
+        log_file_path = Path(settings.LOG_FILE).resolve()
+        log_dir = log_file_path.parent
+        current_dir = log_dir / "current"
+        payments_log = current_dir / settings.LOG_PAYMENTS_FILE
+
+        if not payments_log.exists():
+            try:
+                await callback.message.edit_text(
+                    "❌ <b>Файл логов не найден</b>\n\n"
+                    f"Путь: <code>{payments_log}</code>\n\n"
+                    "<i>Логи появятся после первого успешного платежа.</i>",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_mon_reconcile_logs")],
+                        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_mon_statistics")]
+                    ])
+                )
+            except TelegramBadRequest:
+                pass  # Сообщение не изменилось
+            return
+
+        # Паттерны для парсинга логов
+        # Успешный платёж: "Успешно обработан платеж YooKassa 30e3c6fc-000f-5001-9000-1a9c8b242396: пользователь 1046 пополнил баланс на 200.0₽"
+        payment_pattern = re.compile(
+            r"(\d{4}-\d{2}-\d{2}) \d{2}:\d{2}:\d{2}.*Успешно обработан платеж YooKassa ([a-f0-9-]+).*на ([\d.]+)₽"
+        )
+        # Чек создан: "Чек NaloGO создан для платежа 30e3c6fc-000f-5001-9000-1a9c8b242396: 243udsqtik"
+        receipt_pattern = re.compile(
+            r"(\d{4}-\d{2}-\d{2}) \d{2}:\d{2}:\d{2}.*Чек NaloGO создан для платежа ([a-f0-9-]+): (\w+)"
+        )
+
+        # Читаем и парсим логи
+        payments = {}  # payment_id -> {date, amount}
+        receipts = {}  # payment_id -> {date, receipt_uuid}
+
+        try:
+            with open(payments_log, "r", encoding="utf-8") as f:
+                for line in f:
+                    # Проверяем платежи
+                    match = payment_pattern.search(line)
+                    if match:
+                        date_str, payment_id, amount = match.groups()
+                        payments[payment_id] = {
+                            "date": date_str,
+                            "amount": float(amount)
+                        }
+                        continue
+
+                    # Проверяем чеки
+                    match = receipt_pattern.search(line)
+                    if match:
+                        date_str, payment_id, receipt_uuid = match.groups()
+                        receipts[payment_id] = {
+                            "date": date_str,
+                            "receipt_uuid": receipt_uuid
+                        }
+        except Exception as e:
+            logger.error(f"Ошибка чтения логов: {e}")
+            await callback.message.edit_text(
+                f"❌ <b>Ошибка чтения логов</b>\n\n{str(e)}",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_mon_statistics")]
+                ])
+            )
+            return
+
+        # Находим платежи без чеков
+        payments_without_receipts = []
+        for payment_id, payment_data in payments.items():
+            if payment_id not in receipts:
+                payments_without_receipts.append({
+                    "payment_id": payment_id,
+                    "date": payment_data["date"],
+                    "amount": payment_data["amount"]
+                })
+
+        # Группируем по датам
+        by_date = defaultdict(list)
+        for p in payments_without_receipts:
+            by_date[p["date"]].append(p)
+
+        # Формируем отчёт
+        total_payments = len(payments)
+        total_receipts = len(receipts)
+        missing_count = len(payments_without_receipts)
+        missing_amount = sum(p["amount"] for p in payments_without_receipts)
+
+        text = "📋 <b>Сверка по логам</b>\n\n"
+        text += f"📦 <b>Всего платежей:</b> {total_payments}\n"
+        text += f"🧾 <b>Чеков создано:</b> {total_receipts}\n\n"
+
+        if missing_count == 0:
+            text += "✅ <b>Все платежи имеют чеки!</b>"
+        else:
+            text += f"⚠️ <b>Без чеков:</b> {missing_count} платежей на {missing_amount:,.2f} ₽\n\n"
+
+            # Показываем по датам (последние)
+            sorted_dates = sorted(by_date.keys(), reverse=True)
+            for date_str in sorted_dates[:7]:
+                date_payments = by_date[date_str]
+                date_amount = sum(p["amount"] for p in date_payments)
+                text += f"• <b>{date_str}:</b> {len(date_payments)} шт. на {date_amount:,.2f} ₽\n"
+
+            if len(sorted_dates) > 7:
+                text += f"\n<i>...и ещё {len(sorted_dates) - 7} дней</i>"
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_mon_reconcile_logs")],
+            [InlineKeyboardButton(text="📄 Детали", callback_data="admin_mon_reconcile_logs_details")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_mon_statistics")],
+        ])
+
+        try:
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+        except TelegramBadRequest:
+            pass  # Сообщение не изменилось
+
+    except TelegramBadRequest:
+        pass  # Игнорируем если сообщение не изменилось
+    except Exception as e:
+        logger.error(f"Ошибка сверки по логам: {e}", exc_info=True)
+        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data == "admin_mon_reconcile_logs")
+@admin_required
+async def receipts_reconcile_logs_refresh_callback(callback: CallbackQuery):
+    """Обновить сверку по логам."""
+    await _do_reconcile_logs(callback)
+
+
+@router.callback_query(F.data == "admin_mon_reconcile_logs_details")
+@admin_required
+async def receipts_reconcile_logs_details_callback(callback: CallbackQuery):
+    """Детальный список платежей без чеков."""
+    try:
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        from pathlib import Path
+        import re
+
+        await callback.answer("🔄 Загружаю детали...", show_alert=False)
+
+        # Путь к логам (logs/current/)
+        log_file_path = Path(settings.LOG_FILE).resolve()
+        log_dir = log_file_path.parent
+        current_dir = log_dir / "current"
+        payments_log = current_dir / settings.LOG_PAYMENTS_FILE
+
+        if not payments_log.exists():
+            await callback.answer("❌ Файл логов не найден", show_alert=True)
+            return
+
+        payment_pattern = re.compile(
+            r"(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}).*Успешно обработан платеж YooKassa ([a-f0-9-]+).*пользователь (\d+).*на ([\d.]+)₽"
+        )
+        receipt_pattern = re.compile(
+            r"Чек NaloGO создан для платежа ([a-f0-9-]+)"
+        )
+
+        payments = {}
+        receipts = set()
+
+        with open(payments_log, "r", encoding="utf-8") as f:
+            for line in f:
+                match = payment_pattern.search(line)
+                if match:
+                    date_str, time_str, payment_id, user_id, amount = match.groups()
+                    payments[payment_id] = {
+                        "date": date_str,
+                        "time": time_str,
+                        "user_id": user_id,
+                        "amount": float(amount)
+                    }
+                    continue
+
+                match = receipt_pattern.search(line)
+                if match:
+                    receipts.add(match.group(1))
+
+        # Платежи без чеков
+        missing = []
+        for payment_id, data in payments.items():
+            if payment_id not in receipts:
+                missing.append({"payment_id": payment_id, **data})
+
+        # Сортируем по дате (новые сверху)
+        missing.sort(key=lambda x: (x["date"], x["time"]), reverse=True)
+
+        if not missing:
+            text = "✅ <b>Все платежи имеют чеки!</b>"
+        else:
+            text = f"📄 <b>Платежи без чеков ({len(missing)} шт.)</b>\n\n"
+
+            for p in missing[:20]:
+                text += (
+                    f"• <b>{p['date']} {p['time']}</b>\n"
+                    f"  User: {p['user_id']} | {p['amount']:.0f}₽\n"
+                    f"  <code>{p['payment_id'][:18]}...</code>\n\n"
+                )
+
+            if len(missing) > 20:
+                text += f"<i>...и ещё {len(missing) - 20} платежей</i>"
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_mon_reconcile_logs")],
+        ])
+
+        try:
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+        except TelegramBadRequest:
+            pass
+
+    except TelegramBadRequest:
+        pass
+    except Exception as e:
+        logger.error(f"Ошибка детализации: {e}", exc_info=True)
+        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
 
 
 def get_monitoring_logs_keyboard(current_page: int, total_pages: int):

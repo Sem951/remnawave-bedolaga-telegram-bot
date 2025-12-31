@@ -17,7 +17,11 @@ uvicorn==0.32.1
 python-multipart==0.0.9
 
 # YooKassa SDK
-yookassa==3.7.0
+yookassa==3.9.0
+
+# NaloGO для чеков в налоговую
+# nalogo - используем локальную исправленную версию в app/lib/nalogo/
+httpx  # зависимость для nalogo
 
 # Логирование и мониторинг
 structlog==23.2.0
@@ -38,3 +42,6 @@ aiofiles==23.2.1
 
 # Вебхуки PayPalych (Flask)
 Flask==3.1.0
+
+# Архивирование с паролем
+pyzipper==0.3.6

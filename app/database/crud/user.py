@@ -28,6 +28,48 @@ from app.utils.validators import sanitize_telegram_name
 logger = logging.getLogger(__name__)
 
 
+def _build_spending_stats_select():
+    """
+    Возвращает базовый SELECT для статистики трат пользователей.
+
+    Используется в:
+    - get_users_list() для сортировки по тратам/покупкам
+    - get_users_spending_stats() для получения статистики
+
+    Returns:
+        Tuple колонок (user_id, total_spent, purchase_count)
+    """
+    from app.database.models import Transaction
+
+    return (
+        Transaction.user_id.label("user_id"),
+        func.coalesce(
+            func.sum(
+                case(
+                    (
+                        Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
+                        Transaction.amount_kopeks,
+                    ),
+                    else_=0,
+                )
+            ),
+            0,
+        ).label("total_spent"),
+        func.coalesce(
+            func.sum(
+                case(
+                    (
+                        Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
+                        1,
+                    ),
+                    else_=0,
+                )
+            ),
+            0,
+        ).label("purchase_count"),
+    )
+
+
 def generate_referral_code() -> str:
     alphabet = string.ascii_letters + string.digits
     code_suffix = ''.join(secrets.choice(alphabet) for _ in range(8))
@@ -331,13 +373,14 @@ async def add_user_balance(
     description: str = "Пополнение баланса",
     create_transaction: bool = True,
     transaction_type: TransactionType = TransactionType.DEPOSIT,
-    bot = None
+    bot = None,
+    payment_method: Optional[PaymentMethod] = None
 ) -> bool:
     try:
         old_balance = user.balance_kopeks
         user.balance_kopeks += amount_kopeks
         user.updated_at = datetime.utcnow()
-        
+
         if create_transaction:
             from app.database.crud.transaction import create_transaction as create_trans
 
@@ -346,7 +389,8 @@ async def add_user_balance(
                 user_id=user.id,
                 type=transaction_type,
                 amount_kopeks=amount_kopeks,
-                description=description
+                description=description,
+                payment_method=payment_method
             )
         
         await db.commit()
@@ -368,19 +412,21 @@ async def add_user_balance_by_id(
     amount_kopeks: int,
     description: str = "Пополнение баланса",
     transaction_type: TransactionType = TransactionType.DEPOSIT,
+    payment_method: Optional[PaymentMethod] = None,
 ) -> bool:
     try:
         user = await get_user_by_telegram_id(db, telegram_id)
         if not user:
             logger.error(f"Пользователь с telegram_id {telegram_id} не найден")
             return False
-        
+
         return await add_user_balance(
             db,
             user,
             amount_kopeks,
             description,
             transaction_type=transaction_type,
+            payment_method=payment_method,
         )
         
     except Exception as e:
@@ -657,33 +703,7 @@ async def get_users_list(
         from app.database.models import Transaction
 
         transactions_stats = (
-            select(
-                Transaction.user_id.label("user_id"),
-                func.coalesce(
-                    func.sum(
-                        case(
-                            (
-                                Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
-                                Transaction.amount_kopeks,
-                            ),
-                            else_=0,
-                        )
-                    ),
-                    0,
-                ).label("total_spent"),
-                func.coalesce(
-                    func.sum(
-                        case(
-                            (
-                                Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
-                                1,
-                            ),
-                            else_=0,
-                        )
-                    ),
-                    0,
-                ).label("purchase_count"),
-            )
+            select(*_build_spending_stats_select())
             .where(Transaction.is_completed.is_(True))
             .group_by(Transaction.user_id)
             .subquery()
@@ -760,39 +780,23 @@ async def get_users_spending_stats(
     db: AsyncSession,
     user_ids: List[int]
 ) -> Dict[int, Dict[str, int]]:
+    """
+    Получает статистику трат для списка пользователей.
+
+    Args:
+        db: Сессия базы данных
+        user_ids: Список ID пользователей
+
+    Returns:
+        Словарь {user_id: {"total_spent": int, "purchase_count": int}}
+    """
     if not user_ids:
         return {}
 
     from app.database.models import Transaction
 
     stats_query = (
-        select(
-            Transaction.user_id,
-            func.coalesce(
-                func.sum(
-                    case(
-                        (
-                            Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
-                            Transaction.amount_kopeks,
-                        ),
-                        else_=0,
-                    )
-                ),
-                0,
-            ).label("total_spent"),
-            func.coalesce(
-                func.sum(
-                    case(
-                        (
-                            Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
-                            1,
-                        ),
-                        else_=0,
-                    )
-                ),
-                0,
-            ).label("purchase_count"),
-        )
+        select(*_build_spending_stats_select())
         .where(
             Transaction.user_id.in_(user_ids),
             Transaction.is_completed.is_(True),
@@ -989,3 +993,30 @@ async def get_users_statistics(db: AsyncSession) -> dict:
         "new_week": new_week,
         "new_month": new_month
     }
+
+
+async def get_users_with_active_subscriptions(db: AsyncSession) -> List[User]:
+    """
+    Получает список пользователей с активными подписками.
+    Используется для мониторинга трафика.
+
+    Returns:
+        Список пользователей с активными подписками и remnawave_uuid
+    """
+    current_time = datetime.utcnow()
+
+    result = await db.execute(
+        select(User)
+        .join(Subscription, User.id == Subscription.user_id)
+        .where(
+            and_(
+                User.remnawave_uuid.isnot(None),
+                User.status == UserStatus.ACTIVE.value,
+                Subscription.status == SubscriptionStatus.ACTIVE.value,
+                Subscription.end_date > current_time,
+            )
+        )
+        .options(selectinload(User.subscription))
+    )
+
+    return result.scalars().unique().all()

@@ -15,8 +15,10 @@ from .routes import (
     health,
     main_menu_buttons,
     media,
+    menu_layout,
     miniapp,
     partners,
+    pinned_messages,
     polls,
     promocodes,
     promo_groups,
@@ -25,6 +27,7 @@ from .routes import (
     welcome_texts,
     pages,
     remnawave,
+    contests,
     servers,
     subscription_events,
     stats,
@@ -53,6 +56,10 @@ OPENAPI_TAGS = [
     {
         "name": "main-menu",
         "description": "Управление кнопками и сообщениями главного меню Telegram-бота.",
+    },
+    {
+        "name": "menu-layout",
+        "description": "API конструктор меню: управление расположением и настройками кнопок.",
     },
     {
         "name": "welcome-texts",
@@ -134,6 +141,17 @@ OPENAPI_TAGS = [
             "сменах промогрупп пользователей для административной панели."
         ),
     },
+    {
+        "name": "contests",
+        "description": "Управление конкурсами: реферальными и ежедневными играми/раундами.",
+    },
+    {
+        "name": "pinned-messages",
+        "description": (
+            "Управление закреплёнными сообщениями: создание, обновление, рассылка и "
+            "настройка показа при /start."
+        ),
+    },
 ]
 
 
@@ -179,10 +197,16 @@ def create_web_api_app() -> FastAPI:
     app.include_router(promo_groups.router, prefix="/promo-groups", tags=["promo-groups"])
     app.include_router(promo_offers.router, prefix="/promo-offers", tags=["promo-offers"])
     app.include_router(servers.router, prefix="/servers", tags=["servers"])
+    app.include_router(contests.router, prefix="/contests", tags=["contests"])
     app.include_router(
         main_menu_buttons.router,
         prefix="/main-menu/buttons",
         tags=["main-menu"],
+    )
+    app.include_router(
+        menu_layout.router,
+        prefix="/menu-layout",
+        tags=["menu-layout"],
     )
     app.include_router(
         user_messages.router,
@@ -206,6 +230,11 @@ def create_web_api_app() -> FastAPI:
     app.include_router(partners.router, prefix="/partners", tags=["partners"])
     app.include_router(polls.router, prefix="/polls", tags=["polls"])
     app.include_router(logs.router, prefix="/logs", tags=["logs"])
+    app.include_router(
+        pinned_messages.router,
+        prefix="/pinned-messages",
+        tags=["pinned-messages"],
+    )
     app.include_router(
         subscription_events.router,
         prefix="/notifications/subscriptions",

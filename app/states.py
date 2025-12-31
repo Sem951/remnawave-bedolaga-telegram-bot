@@ -45,7 +45,8 @@ class AdminStates(StatesGroup):
     adding_traffic = State()
     granting_subscription = State()
     editing_user_subscription = State()
-    
+    editing_user_restriction_reason = State()
+
     creating_promocode = State()
     setting_promocode_type = State()
     setting_promocode_value = State()
@@ -90,6 +91,17 @@ class AdminStates(StatesGroup):
     editing_promo_group_device_discount = State()
     editing_promo_group_period_discount = State()
     editing_promo_group_auto_assign = State()
+
+    creating_referral_contest_title = State()
+    creating_referral_contest_description = State()
+    creating_referral_contest_prize = State()
+    creating_referral_contest_mode = State()
+    creating_referral_contest_start = State()
+    creating_referral_contest_end = State()
+    creating_referral_contest_time = State()
+    editing_referral_contest_summary_times = State()
+    editing_daily_contest_field = State()
+    editing_daily_contest_value = State()
     
     editing_squad_price = State()
     editing_traffic_price = State()
@@ -123,6 +135,8 @@ class AdminStates(StatesGroup):
     creating_server_country = State()
 
     editing_welcome_text = State()
+    editing_pinned_message = State()
+    confirming_pinned_broadcast = State()
     waiting_for_message_buttons = "waiting_for_message_buttons"
 
     editing_promo_offer_message = State()
@@ -189,6 +203,9 @@ class SquadMigrationStates(StatesGroup):
 
 class RemnaWaveSyncStates(StatesGroup):
     waiting_for_schedule = State()
+
+class ContestStates(StatesGroup):
+    waiting_for_answer = State()
 
 
 class AdminSubmenuStates(StatesGroup):

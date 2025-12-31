@@ -94,7 +94,8 @@ class SubscriptionService:
         secret_key = (auth_params.get("secret_key") or "").strip() or None
         username = (auth_params.get("username") or "").strip() or None
         password = (auth_params.get("password") or "").strip() or None
-        auth_type = (auth_params.get("auth_type") or "").strip() or None
+        caddy_token = (auth_params.get("caddy_token") or "").strip() or None
+        auth_type = (auth_params.get("auth_type") or "api_key").strip()
 
         config_signature = (
             base_url,
@@ -102,7 +103,8 @@ class SubscriptionService:
             secret_key or "",
             username or "",
             password or "",
-            auth_type or "",
+            caddy_token or "",
+            auth_type,
         )
 
         if config_signature == self._last_config_signature:
@@ -122,6 +124,8 @@ class SubscriptionService:
                 secret_key=secret_key,
                 username=username,
                 password=password,
+                caddy_token=caddy_token,
+                auth_type=auth_type,
             )
 
         if self._config_error:
@@ -461,7 +465,105 @@ class SubscriptionService:
         except Exception as e:
             logger.error(f"Ошибка синхронизации трафика: {e}")
             return False
-    
+
+    async def ensure_subscription_synced(
+        self,
+        db: AsyncSession,
+        subscription: Subscription,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Проверяет и синхронизирует подписку с RemnaWave при необходимости.
+
+        Если subscription_url отсутствует или данные не синхронизированы,
+        пытается обновить/создать пользователя в RemnaWave.
+
+        Returns:
+            Tuple[bool, Optional[str]]: (успех, сообщение об ошибке)
+        """
+        try:
+            user = await get_user_by_id(db, subscription.user_id)
+            if not user:
+                logger.error(f"Пользователь не найден для подписки {subscription.id}")
+                return False, "user_not_found"
+
+            # Проверяем, нужна ли синхронизация
+            needs_sync = (
+                not subscription.subscription_url
+                or not user.remnawave_uuid
+            )
+
+            if not needs_sync:
+                # Проверяем, существует ли пользователь в RemnaWave
+                try:
+                    async with self.get_api_client() as api:
+                        remnawave_user = await api.get_user_by_uuid(user.remnawave_uuid)
+                        if not remnawave_user:
+                            needs_sync = True
+                            logger.warning(
+                                f"Пользователь {user.remnawave_uuid} не найден в RemnaWave, требуется синхронизация"
+                            )
+                except Exception as check_error:
+                    logger.warning(f"Не удалось проверить пользователя в RemnaWave: {check_error}")
+                    # Продолжаем, возможно проблема временная
+
+            if not needs_sync:
+                return True, None
+
+            logger.info(
+                f"Синхронизация подписки {subscription.id} с RemnaWave "
+                f"(subscription_url={bool(subscription.subscription_url)}, "
+                f"remnawave_uuid={bool(user.remnawave_uuid)})"
+            )
+
+            # Пытаемся синхронизировать
+            result = None
+            if user.remnawave_uuid:
+                # Пробуем обновить существующего пользователя
+                result = await self.update_remnawave_user(
+                    db,
+                    subscription,
+                    reset_traffic=False,
+                )
+                # Если update не удался (пользователь удалён из RemnaWave) — пробуем создать
+                if not result:
+                    logger.warning(
+                        f"Не удалось обновить пользователя {user.remnawave_uuid} в RemnaWave, "
+                        f"пробуем создать заново"
+                    )
+                    # Сбрасываем старый UUID, create_remnawave_user установит новый
+                    user.remnawave_uuid = None
+                    result = await self.create_remnawave_user(
+                        db,
+                        subscription,
+                        reset_traffic=False,
+                    )
+            else:
+                # Создаём нового пользователя
+                result = await self.create_remnawave_user(
+                    db,
+                    subscription,
+                    reset_traffic=False,
+                )
+
+            if result:
+                await db.refresh(subscription)
+                await db.refresh(user)
+                logger.info(
+                    f"Подписка {subscription.id} успешно синхронизирована с RemnaWave. "
+                    f"URL: {subscription.subscription_url}"
+                )
+                return True, None
+            else:
+                logger.error(f"Не удалось синхронизировать подписку {subscription.id} с RemnaWave")
+                return False, "sync_failed"
+
+        except RemnaWaveAPIError as api_error:
+            logger.error(f"Ошибка RemnaWave API при синхронизации подписки {subscription.id}: {api_error}")
+            return False, "api_error"
+        except Exception as e:
+            logger.error(f"Ошибка синхронизации подписки {subscription.id}: {e}")
+            return False, "unknown_error"
+
     async def calculate_subscription_price(
         self,
         period_days: int,
@@ -628,7 +730,12 @@ class SubscriptionService:
             devices_discount = devices_price * devices_discount_percent // 100
             discounted_devices_price = devices_price - devices_discount
 
-            traffic_price = settings.get_traffic_price(subscription.traffic_limit_gb)
+            # В режиме fixed_with_topup при продлении используем фиксированный лимит
+            if settings.is_traffic_fixed():
+                renewal_traffic_gb = settings.get_fixed_traffic_limit()
+            else:
+                renewal_traffic_gb = subscription.traffic_limit_gb
+            traffic_price = settings.get_traffic_price(renewal_traffic_gb)
             traffic_discount_percent = _resolve_discount_percent(
                 user,
                 promo_group,
@@ -970,7 +1077,12 @@ class SubscriptionService:
             discounted_devices_per_month = devices_price_per_month - devices_discount_per_month
             total_devices_price = discounted_devices_per_month * months_in_period
 
-            traffic_price_per_month = settings.get_traffic_price(subscription.traffic_limit_gb)
+            # В режиме fixed_with_topup при продлении используем фиксированный лимит
+            if settings.is_traffic_fixed():
+                renewal_traffic_gb = settings.get_fixed_traffic_limit()
+            else:
+                renewal_traffic_gb = subscription.traffic_limit_gb
+            traffic_price_per_month = settings.get_traffic_price(renewal_traffic_gb)
             traffic_discount_percent = _resolve_discount_percent(
                 user,
                 promo_group,
@@ -1136,8 +1248,8 @@ class SubscriptionService:
         logger.info(f"Итого доплата за {months_to_pay} мес: {total_price/100}₽")
         return total_price
     
-    def _gb_to_bytes(self, gb: int) -> int:
-        if gb == 0: 
+    def _gb_to_bytes(self, gb: Optional[int]) -> int:
+        if not gb:  # None or 0
             return 0
         return gb * 1024 * 1024 * 1024
     

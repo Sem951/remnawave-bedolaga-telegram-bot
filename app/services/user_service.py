@@ -224,7 +224,7 @@ class UserService:
         db: AsyncSession,
         min_balance_kopeks: int,
         page: int = 1,
-        limit: int = 20,
+        limit: int = 10,
     ) -> Dict[str, Any]:
         """Возвращает пользователей с истекшей подпиской и достаточным балансом."""
         try:
@@ -247,7 +247,7 @@ class UserService:
                 .limit(limit)
             )
             result = await db.execute(query)
-            users = result.scalars().all()
+            users = result.scalars().unique().all()
 
             count_query = (
                 select(func.count(User.id))
@@ -395,7 +395,11 @@ class UserService:
             old_balance = user.balance_kopeks
 
             if amount_kopeks > 0:
-                await add_user_balance(db, user, amount_kopeks, description=description)
+                await add_user_balance(
+                    db, user, amount_kopeks,
+                    description=description,
+                    payment_method=PaymentMethod.MANUAL
+                )
                 logger.info(f"Админ {admin_id} пополнил баланс пользователя {user_id} на {amount_kopeks/100}₽")
                 success = True
             else:

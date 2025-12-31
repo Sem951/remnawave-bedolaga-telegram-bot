@@ -464,17 +464,61 @@ async def show_my_tickets_closed(
     await callback.answer()
 
 
+def _split_long_block(block: str, max_len: int) -> list[str]:
+    """Разбивает слишком длинный блок на части."""
+    if len(block) <= max_len:
+        return [block]
+
+    parts = []
+    remaining = block
+    while remaining:
+        if len(remaining) <= max_len:
+            parts.append(remaining)
+            break
+        # Ищем место для разрыва (перенос строки или пробел)
+        cut_at = max_len
+        newline_pos = remaining.rfind('\n', 0, max_len)
+        space_pos = remaining.rfind(' ', 0, max_len)
+
+        if newline_pos > max_len // 2:
+            cut_at = newline_pos + 1
+        elif space_pos > max_len // 2:
+            cut_at = space_pos + 1
+
+        parts.append(remaining[:cut_at])
+        remaining = remaining[cut_at:]
+
+    return parts
+
+
 def _split_text_into_pages(header: str, message_blocks: list[str], max_len: int = 3500) -> list[str]:
+    """Разбивает текст на страницы с учётом лимита Telegram."""
     pages: list[str] = []
     current = header
+    header_len = len(header)
+    block_max_len = max_len - header_len - 50  # запас для безопасности
+
     for block in message_blocks:
-        if len(current) + len(block) > max_len:
-            pages.append(current)
+        # Если блок сам по себе слишком длинный — разбиваем его
+        if len(block) > block_max_len:
+            block_parts = _split_long_block(block, block_max_len)
+            for part in block_parts:
+                if len(current) + len(part) > max_len:
+                    if current.strip() and current != header:
+                        pages.append(current)
+                    current = header + part
+                else:
+                    current += part
+        elif len(current) + len(block) > max_len:
+            if current.strip() and current != header:
+                pages.append(current)
             current = header + block
         else:
             current += block
+
     if current.strip():
         pages.append(current)
+
     return pages if pages else [header]
 
 
@@ -792,7 +836,7 @@ async def handle_ticket_reply(
         )
         
         texts = get_texts(db_user.language)
-        
+
         await message.answer(
             texts.t("TICKET_REPLY_SENT", "✅ Ваш ответ отправлен!"),
             reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
@@ -806,9 +850,13 @@ async def handle_ticket_reply(
                 )]
             ])
         )
-        
+
         await state.clear()
-        
+
+        # Уведомить админов об ответе пользователя
+        logger.info(f"Attempting to notify admins about ticket reply #{ticket_id}")
+        await notify_admins_about_ticket_reply(ticket, reply_text, db)
+
     except Exception as e:
         logger.error(f"Error adding ticket reply: {e}")
         texts = get_texts(db_user.language)
@@ -969,6 +1017,54 @@ async def notify_admins_about_new_ticket(ticket: Ticket, db: AsyncSession):
         await service.send_ticket_event_notification(notification_text, None)
     except Exception as e:
         logger.error(f"Error notifying admins about new ticket: {e}")
+
+
+async def notify_admins_about_ticket_reply(ticket: Ticket, reply_text: str, db: AsyncSession):
+    """Уведомить админов об ответе пользователя на тикет"""
+    logger.info(f"notify_admins_about_ticket_reply called for ticket #{ticket.id}")
+    try:
+        from app.config import settings
+        if not settings.is_admin_notifications_enabled():
+            logger.info(f"Admin notifications disabled. Reply to ticket #{ticket.id}")
+            return
+
+        title = (ticket.title or '').strip()
+        if len(title) > 60:
+            title = title[:57] + "..."
+
+        # Загрузим пользователя
+        try:
+            user = await get_user_by_id(db, ticket.user_id)
+        except Exception:
+            user = None
+        full_name = user.full_name if user else "Unknown"
+        telegram_id_display = user.telegram_id if user else "—"
+        username_display = (user.username or "отсутствует") if user else "отсутствует"
+
+        # Обрезаем текст ответа для уведомления
+        reply_preview = reply_text[:150] + "..." if len(reply_text) > 150 else reply_text
+
+        notification_text = (
+            f"💬 <b>ОТВЕТ НА ТИКЕТ</b>\n\n"
+            f"🆔 <b>ID тикета:</b> <code>{ticket.id}</code>\n"
+            f"📝 <b>Заголовок:</b> {title or '—'}\n"
+            f"👤 <b>Пользователь:</b> {full_name}\n"
+            f"🆔 <b>Telegram ID:</b> <code>{telegram_id_display}</code>\n"
+            f"📱 <b>Username:</b> @{username_display}\n\n"
+            f"📩 <b>Сообщение:</b>\n{reply_preview}\n"
+        )
+
+        from app.services.maintenance_service import maintenance_service
+        bot = maintenance_service._bot or None
+        if bot is None:
+            logger.warning("Bot instance is not available for admin notifications")
+            return
+
+        service = AdminNotificationService(bot)
+        result = await service.send_ticket_event_notification(notification_text, None)
+        logger.info(f"Ticket #{ticket.id} reply notification sent: {result}")
+    except Exception as e:
+        logger.error(f"Error notifying admins about ticket reply: {e}")
 
 
 def register_handlers(dp: Dispatcher):

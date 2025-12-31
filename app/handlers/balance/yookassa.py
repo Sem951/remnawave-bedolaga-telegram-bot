@@ -25,7 +25,24 @@ async def start_yookassa_payment(
     state: FSMContext
 ):
     texts = get_texts(db_user.language)
-    
+
+    # Проверка ограничения на пополнение
+    if getattr(db_user, 'restriction_topup', False):
+        reason = getattr(db_user, 'restriction_reason', None) or "Действие ограничено администратором"
+        support_url = settings.get_support_contact_url()
+        keyboard = []
+        if support_url:
+            keyboard.append([types.InlineKeyboardButton(text="🆘 Обжаловать", url=support_url)])
+        keyboard.append([types.InlineKeyboardButton(text=texts.BACK, callback_data="menu_balance")])
+
+        await callback.message.edit_text(
+            f"🚫 <b>Пополнение ограничено</b>\n\n{reason}\n\n"
+            "Если вы считаете это ошибкой, вы можете обжаловать решение.",
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=keyboard)
+        )
+        await callback.answer()
+        return
+
     if not settings.is_yookassa_enabled():
         await callback.answer("❌ Оплата картой через YooKassa временно недоступна", show_alert=True)
         return
@@ -34,7 +51,7 @@ async def start_yookassa_payment(
     max_amount_rub = settings.YOOKASSA_MAX_AMOUNT_KOPEKS / 100
     
     # Формируем текст сообщения в зависимости от настройки
-    if settings.YOOKASSA_QUICK_AMOUNT_SELECTION_ENABLED and not settings.DISABLE_TOPUP_BUTTONS:
+    if settings.is_quick_amount_buttons_enabled():
         message_text = (
             f"💳 <b>Оплата банковской картой</b>\n\n"
             f"Выберите сумму пополнения или введите вручную сумму "
@@ -50,7 +67,7 @@ async def start_yookassa_payment(
     keyboard = get_back_keyboard(db_user.language)
     
     # Если включен быстрый выбор суммы и не отключены кнопки, добавляем кнопки
-    if settings.YOOKASSA_QUICK_AMOUNT_SELECTION_ENABLED and not settings.DISABLE_TOPUP_BUTTONS:
+    if settings.is_quick_amount_buttons_enabled():
         from .main import get_quick_amount_buttons
         quick_amount_buttons = get_quick_amount_buttons(db_user.language, db_user)
         if quick_amount_buttons:
@@ -79,7 +96,24 @@ async def start_yookassa_sbp_payment(
     state: FSMContext
 ):
     texts = get_texts(db_user.language)
-    
+
+    # Проверка ограничения на пополнение
+    if getattr(db_user, 'restriction_topup', False):
+        reason = getattr(db_user, 'restriction_reason', None) or "Действие ограничено администратором"
+        support_url = settings.get_support_contact_url()
+        keyboard = []
+        if support_url:
+            keyboard.append([types.InlineKeyboardButton(text="🆘 Обжаловать", url=support_url)])
+        keyboard.append([types.InlineKeyboardButton(text=texts.BACK, callback_data="menu_balance")])
+
+        await callback.message.edit_text(
+            f"🚫 <b>Пополнение ограничено</b>\n\n{reason}\n\n"
+            "Если вы считаете это ошибкой, вы можете обжаловать решение.",
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=keyboard)
+        )
+        await callback.answer()
+        return
+
     if not settings.is_yookassa_enabled() or not settings.YOOKASSA_SBP_ENABLED:
         await callback.answer("❌ Оплата через СБП временно недоступна", show_alert=True)
         return
@@ -88,7 +122,7 @@ async def start_yookassa_sbp_payment(
     max_amount_rub = settings.YOOKASSA_MAX_AMOUNT_KOPEKS / 100
     
     # Формируем текст сообщения в зависимости от настройки
-    if settings.YOOKASSA_QUICK_AMOUNT_SELECTION_ENABLED and not settings.DISABLE_TOPUP_BUTTONS:
+    if settings.is_quick_amount_buttons_enabled():
         message_text = (
             f"🏦 <b>Оплата через СБП</b>\n\n"
             f"Выберите сумму пополнения или введите вручную сумму "
@@ -104,7 +138,7 @@ async def start_yookassa_sbp_payment(
     keyboard = get_back_keyboard(db_user.language)
     
     # Если включен быстрый выбор суммы и не отключены кнопки, добавляем кнопки
-    if settings.YOOKASSA_QUICK_AMOUNT_SELECTION_ENABLED and not settings.DISABLE_TOPUP_BUTTONS:
+    if settings.is_quick_amount_buttons_enabled():
         from .main import get_quick_amount_buttons
         quick_amount_buttons = get_quick_amount_buttons(db_user.language, db_user)
         if quick_amount_buttons:
@@ -134,6 +168,26 @@ async def process_yookassa_payment_amount(
     amount_kopeks: int,
     state: FSMContext
 ):
+    texts = get_texts(db_user.language)
+
+    # Проверка ограничения на пополнение
+    if getattr(db_user, 'restriction_topup', False):
+        reason = getattr(db_user, 'restriction_reason', None) or "Действие ограничено администратором"
+        support_url = settings.get_support_contact_url()
+        keyboard = []
+        if support_url:
+            keyboard.append([types.InlineKeyboardButton(text="🆘 Обжаловать", url=support_url)])
+        keyboard.append([types.InlineKeyboardButton(text=texts.BACK, callback_data="menu_balance")])
+
+        await message.answer(
+            f"🚫 <b>Пополнение ограничено</b>\n\n{reason}\n\n"
+            "Если вы считаете это ошибкой, вы можете обжаловать решение.",
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=keyboard),
+            parse_mode="HTML"
+        )
+        await state.clear()
+        return
+
     # Проверяем, находится ли пользователь в черном списке
     is_blacklisted, blacklist_reason = await blacklist_service.is_user_blacklisted(
         message.from_user.id,
@@ -175,7 +229,7 @@ async def process_yookassa_payment_amount(
             db=db,
             user_id=db_user.id,
             amount_kopeks=amount_kopeks,
-            description=settings.get_balance_payment_description(amount_kopeks),
+            description=settings.get_balance_payment_description(amount_kopeks, telegram_user_id=db_user.telegram_id),
             receipt_email=None,
             receipt_phone=None,
             metadata={
@@ -280,6 +334,26 @@ async def process_yookassa_sbp_payment_amount(
     amount_kopeks: int,
     state: FSMContext
 ):
+    texts = get_texts(db_user.language)
+
+    # Проверка ограничения на пополнение
+    if getattr(db_user, 'restriction_topup', False):
+        reason = getattr(db_user, 'restriction_reason', None) or "Действие ограничено администратором"
+        support_url = settings.get_support_contact_url()
+        keyboard = []
+        if support_url:
+            keyboard.append([types.InlineKeyboardButton(text="🆘 Обжаловать", url=support_url)])
+        keyboard.append([types.InlineKeyboardButton(text=texts.BACK, callback_data="menu_balance")])
+
+        await message.answer(
+            f"🚫 <b>Пополнение ограничено</b>\n\n{reason}\n\n"
+            "Если вы считаете это ошибкой, вы можете обжаловать решение.",
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=keyboard),
+            parse_mode="HTML"
+        )
+        await state.clear()
+        return
+
     # Проверяем, находится ли пользователь в черном списке
     is_blacklisted, blacklist_reason = await blacklist_service.is_user_blacklisted(
         message.from_user.id,
@@ -321,7 +395,7 @@ async def process_yookassa_sbp_payment_amount(
             db=db,
             user_id=db_user.id,
             amount_kopeks=amount_kopeks,
-            description=settings.get_balance_payment_description(amount_kopeks),
+            description=settings.get_balance_payment_description(amount_kopeks, telegram_user_id=db_user.telegram_id),
             receipt_email=None,
             receipt_phone=None,
             metadata={

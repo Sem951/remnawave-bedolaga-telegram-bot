@@ -1,7 +1,7 @@
 from typing import List, Optional
 from aiogram import types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from datetime import datetime
+from datetime import datetime, timezone
 from app.database.models import User
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,6 +21,136 @@ from app.utils.subscription_utils import (
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+async def get_main_menu_keyboard_async(
+    db: AsyncSession,
+    language: str = DEFAULT_LANGUAGE,
+    is_admin: bool = False,
+    has_had_paid_subscription: bool = False,
+    has_active_subscription: bool = False,
+    subscription_is_active: bool = False,
+    balance_kopeks: int = 0,
+    subscription=None,
+    show_resume_checkout: bool = False,
+    has_saved_cart: bool = False,
+    *,
+    is_moderator: bool = False,
+    custom_buttons: Optional[list[InlineKeyboardButton]] = None,
+    user=None,  # Добавляем параметр пользователя для получения данных
+) -> InlineKeyboardMarkup:
+    """
+    Асинхронная версия get_main_menu_keyboard с поддержкой конструктора меню.
+
+    Если MENU_LAYOUT_ENABLED=True, использует конфигурацию из БД.
+    Иначе делегирует в синхронную версию.
+    """
+    if settings.MENU_LAYOUT_ENABLED:
+        from app.services.menu_layout_service import MenuLayoutService, MenuContext
+        from datetime import datetime
+
+        # Получаем данные для плейсхолдеров
+        subscription_days_left = 0
+        traffic_used_gb = 0.0
+        traffic_left_gb = 0.0
+        referral_count = 0
+        referral_earnings_kopeks = 0
+        registration_days = 0
+        promo_group_id = None
+        has_autopay = False
+        username = ""
+
+        # Заполняем данными из подписки
+        if subscription:
+            # Дни до окончания подписки
+            if hasattr(subscription, 'days_left'):
+                # Используем свойство из модели, которое правильно вычисляет дни в UTC
+                subscription_days_left = subscription.days_left
+            elif hasattr(subscription, 'end_date') and subscription.end_date:
+                # Fallback: вычисляем вручную, используя UTC
+                now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+                days_left = (subscription.end_date - now_utc).days
+                subscription_days_left = max(0, days_left)
+            
+            # Трафик
+            if hasattr(subscription, 'traffic_used_gb'):
+                traffic_used_gb = subscription.traffic_used_gb or 0.0
+            
+            if hasattr(subscription, 'traffic_limit_gb') and subscription.traffic_limit_gb:
+                traffic_left_gb = max(0, subscription.traffic_limit_gb - (subscription.traffic_used_gb or 0))
+            
+            # Автоплатеж
+            if hasattr(subscription, 'autopay_enabled'):
+                has_autopay = subscription.autopay_enabled
+
+        # Получаем данные пользователя
+        if user:
+            # Имя пользователя
+            if hasattr(user, 'username') and user.username:
+                username = user.username
+            elif hasattr(user, 'first_name') and user.first_name:
+                username = user.first_name
+            
+            # Дни с регистрации
+            if hasattr(user, 'created_at') and user.created_at:
+                now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+                registration_days = (now_utc - user.created_at).days
+            
+            # ID промо-группы
+            if hasattr(user, 'promo_group_id'):
+                promo_group_id = user.promo_group_id
+
+        # Получаем данные о рефералах из БД (если нужно)
+        try:
+            from app.database.crud.referral import get_user_referral_stats
+            if user and hasattr(user, 'id'):
+                referral_data = await get_user_referral_stats(db, user.id)
+                if referral_data:
+                    referral_count = referral_data.get('invited_count', 0)
+                    referral_earnings_kopeks = referral_data.get('total_earned_kopeks', 0)
+        except Exception as e:
+            logger.error(f"Error getting referral data: {e}")
+
+        context = MenuContext(
+            language=language,
+            is_admin=is_admin,
+            is_moderator=is_moderator,
+            has_active_subscription=has_active_subscription,
+            subscription_is_active=subscription_is_active,
+            has_had_paid_subscription=has_had_paid_subscription,
+            balance_kopeks=balance_kopeks,
+            subscription=subscription,
+            show_resume_checkout=show_resume_checkout,
+            has_saved_cart=has_saved_cart,
+            custom_buttons=custom_buttons or [],
+            # Добавляем данные для плейсхолдеров
+            username=username,
+            subscription_days=subscription_days_left,
+            traffic_used_gb=traffic_used_gb,
+            traffic_left_gb=traffic_left_gb,
+            referral_count=referral_count,
+            referral_earnings_kopeks=referral_earnings_kopeks,
+            registration_days=registration_days,
+            promo_group_id=promo_group_id,
+            has_autopay=has_autopay,
+        )
+
+        return await MenuLayoutService.build_keyboard(db, context)
+
+    # Fallback на синхронную версию
+    return get_main_menu_keyboard(
+        language=language,
+        is_admin=is_admin,
+        has_had_paid_subscription=has_had_paid_subscription,
+        has_active_subscription=has_active_subscription,
+        subscription_is_active=subscription_is_active,
+        balance_kopeks=balance_kopeks,
+        subscription=subscription,
+        show_resume_checkout=show_resume_checkout,
+        has_saved_cart=has_saved_cart,
+        is_moderator=is_moderator,
+        custom_buttons=custom_buttons,
+    )
 
 
 def _get_localized_value(values, language: str, default_language: str = "en") -> str:
@@ -308,13 +438,14 @@ def get_main_menu_keyboard(
     if settings.DEBUG:
         print(f"DEBUG KEYBOARD: language={language}, is_admin={is_admin}, has_had_paid={has_had_paid_subscription}, has_active={has_active_subscription}, sub_active={subscription_is_active}, balance={balance_kopeks}")
     
-    if hasattr(texts, 'BALANCE_BUTTON') and balance_kopeks > 0:
-        balance_button_text = texts.BALANCE_BUTTON.format(balance=texts.format_price(balance_kopeks))
+    safe_balance = balance_kopeks or 0
+    if hasattr(texts, 'BALANCE_BUTTON') and safe_balance > 0:
+        balance_button_text = texts.BALANCE_BUTTON.format(balance=texts.format_price(safe_balance))
     else:
         balance_button_text = texts.t(
             "BALANCE_BUTTON_DEFAULT",
             "💰 Баланс: {balance}",
-        ).format(balance=texts.format_price(balance_kopeks))
+        ).format(balance=texts.format_price(safe_balance))
     
     keyboard: list[list[InlineKeyboardButton]] = []
     paired_buttons: list[InlineKeyboardButton] = []
@@ -376,6 +507,19 @@ def get_main_menu_keyboard(
             InlineKeyboardButton(text=texts.MENU_SUBSCRIPTION, callback_data="menu_subscription")
         )
 
+        # Добавляем кнопку докупки трафика для лимитированных подписок
+        if (
+            settings.BUY_TRAFFIC_BUTTON_VISIBLE
+            and settings.is_traffic_topup_enabled()
+            and not settings.is_traffic_topup_blocked()
+            and subscription
+            and not subscription.is_trial
+            and (subscription.traffic_limit_gb or 0) > 0
+        ):
+            paired_buttons.append(
+                InlineKeyboardButton(text=texts.t("BUY_TRAFFIC_BUTTON", "📈 Докупить трафик"), callback_data="buy_traffic")
+            )
+
     keyboard.append([InlineKeyboardButton(text=balance_button_text, callback_data="menu_balance")])
     
     show_trial = not has_had_paid_subscription and not has_active_subscription
@@ -432,21 +576,33 @@ def get_main_menu_keyboard(
         InlineKeyboardButton(text=texts.MENU_PROMOCODE, callback_data="menu_promocode")
     )
     
-    # Добавляем кнопку рефералов только если программа включена
+    # Добавляем кнопку рефералов, только если программа включена
     if settings.is_referral_program_enabled():
         paired_buttons.append(
             InlineKeyboardButton(text=texts.MENU_REFERRALS, callback_data="menu_referrals")
         )
 
-    # Support button is configurable (runtime via service)
+    # Добавляем кнопку конкурсов
+    if settings.CONTESTS_ENABLED and settings.CONTESTS_BUTTON_VISIBLE:
+        paired_buttons.append(
+            InlineKeyboardButton(text=texts.t("CONTESTS_BUTTON", "🎲 Конкурсы"), callback_data="contests_menu")
+        )
+
     try:
         from app.services.support_settings_service import SupportSettingsService
         support_enabled = SupportSettingsService.is_support_menu_enabled()
     except Exception:
         support_enabled = settings.SUPPORT_MENU_ENABLED
+
     if support_enabled:
         paired_buttons.append(
             InlineKeyboardButton(text=texts.MENU_SUPPORT, callback_data="menu_support")
+        )
+
+    # Добавляем кнопку активации
+    if settings.ACTIVATE_BUTTON_VISIBLE:
+        paired_buttons.append(
+            InlineKeyboardButton(text=settings.ACTIVATE_BUTTON_TEXT, callback_data="activate_button")
         )
 
     paired_buttons.append(
@@ -651,10 +807,10 @@ def get_happ_download_link_keyboard(language: str, link: str) -> InlineKeyboardM
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def get_back_keyboard(language: str = DEFAULT_LANGUAGE) -> InlineKeyboardMarkup:
+def get_back_keyboard(language: str = DEFAULT_LANGUAGE, callback_data: str = "back_to_menu") -> InlineKeyboardMarkup:
     texts = get_texts(language)
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=texts.BACK, callback_data="back_to_menu")]
+        [InlineKeyboardButton(text=texts.BACK, callback_data=callback_data)]
     ])
 
 
@@ -837,7 +993,20 @@ def get_subscription_keyboard(
                     callback_data="subscription_settings",
                 )
             ])
-    
+            # Кнопка докупки трафика для платных подписок
+            if (
+                settings.is_traffic_topup_enabled()
+                and not settings.is_traffic_topup_blocked()
+                and subscription
+                and (subscription.traffic_limit_gb or 0) > 0
+            ):
+                keyboard.append([
+                    InlineKeyboardButton(
+                        text=texts.t("BUY_TRAFFIC_BUTTON", "📈 Докупить трафик"),
+                        callback_data="buy_traffic"
+                    )
+                ])
+
     keyboard.append([
         InlineKeyboardButton(text=texts.BACK, callback_data="back_to_menu")
     ])
@@ -979,10 +1148,10 @@ def get_subscription_period_keyboard(
 def get_traffic_packages_keyboard(language: str = DEFAULT_LANGUAGE) -> InlineKeyboardMarkup:
     import logging
     logger = logging.getLogger(__name__)
-    
+
     from app.config import settings
-    
-    if settings.is_traffic_fixed():
+
+    if settings.is_traffic_topup_blocked():
         return get_back_keyboard(language)
     
     logger.info(f"🔍 RAW CONFIG: '{settings.TRAFFIC_PACKAGES_CONFIG}'")
@@ -1224,9 +1393,10 @@ def get_payment_methods_keyboard(amount_kopeks: int, language: str = DEFAULT_LAN
         has_direct_payment_methods = True
 
     if settings.is_platega_enabled() and settings.get_platega_active_methods():
+        platega_name = settings.get_platega_display_name()
         keyboard.append([
             InlineKeyboardButton(
-                text=texts.t("PAYMENT_PLATEGA", "💳 Platega"),
+                text=texts.t("PAYMENT_PLATEGA", f"💳 {platega_name}"),
                 callback_data=_build_callback("platega"),
             )
         ])
@@ -1246,6 +1416,15 @@ def get_payment_methods_keyboard(amount_kopeks: int, language: str = DEFAULT_LAN
             InlineKeyboardButton(
                 text=texts.t("PAYMENT_HELEKET", "🪙 Криптовалюта (Heleket)"),
                 callback_data=_build_callback("heleket")
+            )
+        ])
+        has_direct_payment_methods = True
+
+    if settings.is_cloudpayments_enabled():
+        keyboard.append([
+            InlineKeyboardButton(
+                text=texts.t("PAYMENT_CLOUDPAYMENTS", "💳 Банковская карта (CloudPayments)"),
+                callback_data=_build_callback("cloudpayments")
             )
         ])
         has_direct_payment_methods = True
@@ -1535,7 +1714,7 @@ def get_add_traffic_keyboard(
         if months_multiplier > 1:
             period_text = f" (за {months_multiplier} мес)"
     
-    packages = settings.get_traffic_packages()
+    packages = settings.get_traffic_topup_packages()
     enabled_packages = [pkg for pkg in packages if pkg['enabled']]
     
     if not enabled_packages:
@@ -1691,27 +1870,45 @@ def get_confirm_change_devices_keyboard(new_devices_count: int, price: int, lang
     ])
 
 
-def get_reset_traffic_confirm_keyboard(price_kopeks: int, language: str = DEFAULT_LANGUAGE) -> InlineKeyboardMarkup:
+def get_reset_traffic_confirm_keyboard(
+    price_kopeks: int, 
+    language: str = DEFAULT_LANGUAGE,
+    has_enough_balance: bool = True,
+    missing_kopeks: int = 0,
+) -> InlineKeyboardMarkup:
     from app.config import settings
-    
-    if settings.is_traffic_fixed():
+
+    if settings.is_traffic_topup_blocked():
         return get_back_keyboard(language)
     
     texts = get_texts(language)
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
+    buttons = []
+    
+    if has_enough_balance:
+        # Достаточно средств - показываем кнопку сброса
+        buttons.append([
             InlineKeyboardButton(
                 text=f"✅ Сбросить за {settings.format_price(price_kopeks)}", 
                 callback_data="confirm_reset_traffic"
             )
-        ],
-        [
+        ])
+    else:
+        # Не хватает средств - показываем кнопку пополнения
+        buttons.append([
             InlineKeyboardButton(
-                text=texts.t("PENDING_CANCEL_BUTTON", "⌛ Отмена"),
-                callback_data="menu_subscription",
+                text=texts.t("TOPUP_BALANCE_BUTTON", "💳 Пополнить баланс"),
+                callback_data=f"topup_amount_{missing_kopeks}"
             )
-        ]
+        ])
+    
+    buttons.append([
+        InlineKeyboardButton(
+            text=texts.BACK,
+            callback_data="subscription_settings",
+        )
     ])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_manage_countries_keyboard(
     countries: List[dict],
@@ -2219,6 +2416,14 @@ def get_updated_subscription_settings_keyboard(language: str = DEFAULT_LANGUAGE,
             InlineKeyboardButton(
                 text=texts.t("CHANGE_DEVICES_BUTTON", "📱 Изменить устройства"),
                 callback_data="subscription_change_devices"
+            )
+        ])
+
+    if settings.is_modem_enabled():
+        keyboard.append([
+            InlineKeyboardButton(
+                text=texts.t("MODEM_BUTTON", "📡 Модем"),
+                callback_data="subscription_modem"
             )
         ])
 

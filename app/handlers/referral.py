@@ -27,8 +27,17 @@ async def show_referral_info(
     db_user: User,
     db: AsyncSession
 ):
+    # Проверяем, включена ли реферальная программа
+    if not settings.is_referral_program_enabled():
+        texts = get_texts(db_user.language)
+        await callback.answer(
+            texts.t("REFERRAL_PROGRAM_DISABLED", "Реферальная программа отключена"),
+            show_alert=True
+        )
+        return
+
     texts = get_texts(db_user.language)
-    
+
     summary = await get_user_referral_summary(db, db_user.id)
     
     bot_username = (await callback.bot.get_me()).username
@@ -481,9 +490,11 @@ def register_handlers(dp: Dispatcher):
         F.data == "referral_analytics"
     )
     
+    async def handle_referral_list_page(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+        page = int(callback.data.split('_')[-1])
+        await show_detailed_referral_list(callback, db_user, db, page)
+
     dp.callback_query.register(
-        lambda callback, db_user, db: show_detailed_referral_list(
-            callback, db_user, db, int(callback.data.split('_')[-1])
-        ),
+        handle_referral_list_page,
         F.data.startswith("referral_list_page_")
     )

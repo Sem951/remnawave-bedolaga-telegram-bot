@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import logging
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from importlib import import_module
@@ -17,14 +16,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database.models import PaymentMethod, TransactionType
 from app.services.subscription_auto_purchase_service import (
+    auto_activate_subscription_after_topup,
     auto_purchase_saved_cart_after_topup,
 )
 from app.utils.user_utils import format_referrer_info
-
-logger = logging.getLogger(__name__)
+from app.utils.payment_logger import payment_logger as logger
 
 if TYPE_CHECKING:
-    from app.database.models import YooKassaPayment
+    from app.database.models import YooKassaPayment, Transaction
 
 
 class YooKassaPaymentMixin:
@@ -668,13 +667,10 @@ class YooKassaPaymentMixin:
                             )
 
                             notification_service = AdminNotificationService(self.bot)
-                            
-                            # Обновляем пользователя, чтобы избежать проблем с ленивой загрузкой
-                            from app.database.crud.user import get_user_by_id
-                            refreshed_user = await get_user_by_id(db, user.id)
-                            
+                            # Перезагрузка user при lazy-loading ошибке
+                            # происходит внутри send_balance_topup_notification
                             await notification_service.send_balance_topup_notification(
-                                refreshed_user or user,
+                                user,
                                 transaction,
                                 old_balance,
                                 topup_status=topup_status,
@@ -740,6 +736,22 @@ class YooKassaPaymentMixin:
 
                             if auto_purchase_success:
                                 has_saved_cart = False
+
+                        # Умная автоактивация если автопокупка не сработала
+                        if not auto_purchase_success:
+                            try:
+                                await auto_activate_subscription_after_topup(
+                                    db,
+                                    user,
+                                    bot=getattr(self, "bot", None),
+                                )
+                            except Exception as auto_activate_error:
+                                logger.error(
+                                    "Ошибка умной автоактивации для пользователя %s: %s",
+                                    user.id,
+                                    auto_activate_error,
+                                    exc_info=True,
+                                )
 
                         if has_saved_cart and getattr(self, "bot", None):
                             # Если у пользователя есть сохраненная корзина,
@@ -952,6 +964,15 @@ class YooKassaPaymentMixin:
                     payment.amount_kopeks / 100,
                 )
 
+            # Создаем чек через NaloGO (если NALOGO_ENABLED=true)
+            if hasattr(self, "nalogo_service") and self.nalogo_service:
+                await self._create_nalogo_receipt(
+                    db=db,
+                    payment=payment,
+                    transaction=transaction,
+                    telegram_user_id=user.telegram_id if user else None,
+                )
+
             return True
 
         except Exception as error:
@@ -1001,6 +1022,68 @@ class YooKassaPaymentMixin:
             )
 
         return updated_metadata
+
+    async def _create_nalogo_receipt(
+        self,
+        db: AsyncSession,
+        payment: "YooKassaPayment",
+        transaction: Optional["Transaction"] = None,
+        telegram_user_id: Optional[int] = None,
+    ) -> None:
+        """Создание чека через NaloGO для успешного платежа."""
+        if not hasattr(self, "nalogo_service") or not self.nalogo_service:
+            logger.debug("NaloGO сервис не инициализирован, чек не создан")
+            return
+
+        # Защита от дублей: если у транзакции уже есть чек — не создаём новый
+        if transaction and getattr(transaction, "receipt_uuid", None):
+            logger.info(
+                f"Чек для платежа {payment.yookassa_payment_id} уже создан: {transaction.receipt_uuid}, "
+                "пропускаем повторное создание"
+            )
+            return
+
+        try:
+            amount_rubles = payment.amount_kopeks / 100
+            # Формируем описание из настроек (включает сумму и ID пользователя)
+            receipt_name = settings.get_balance_payment_description(
+                payment.amount_kopeks, telegram_user_id
+            )
+
+            receipt_uuid = await self.nalogo_service.create_receipt(
+                name=receipt_name,
+                amount=amount_rubles,
+                quantity=1,
+                payment_id=payment.yookassa_payment_id,
+                telegram_user_id=telegram_user_id,
+                amount_kopeks=payment.amount_kopeks,
+            )
+
+            if receipt_uuid:
+                logger.info(f"Чек NaloGO создан для платежа {payment.yookassa_payment_id}: {receipt_uuid}")
+
+                # Сохраняем receipt_uuid в транзакцию
+                if transaction:
+                    try:
+                        transaction.receipt_uuid = receipt_uuid
+                        transaction.receipt_created_at = datetime.utcnow()
+                        await db.commit()
+                        logger.debug(
+                            f"Чек {receipt_uuid} привязан к транзакции {transaction.id}"
+                        )
+                    except Exception as save_error:
+                        logger.warning(
+                            f"Не удалось сохранить receipt_uuid в транзакцию: {save_error}"
+                        )
+            # При временной недоступности чек добавляется в очередь автоматически
+
+        except Exception as error:
+            logger.error(
+                "Ошибка создания чека NaloGO для платежа %s: %s",
+                payment.yookassa_payment_id,
+                error,
+                exc_info=True,
+            )
 
     async def process_yookassa_webhook(
         self,

@@ -83,8 +83,9 @@ class BotConfigurationService:
         "TELEGRAM": "⭐ Telegram Stars",
         "CRYPTOBOT": "🪙 CryptoBot",
         "HELEKET": "🪙 Heleket",
+        "CLOUDPAYMENTS": "💳 CloudPayments",
         "YOOKASSA": "🟣 YooKassa",
-        "PLATEGA": "💳 Platega",
+        "PLATEGA": "💳 {platega_name}",
         "TRIBUTE": "🎁 Tribute",
         "MULENPAY": "💰 {mulenpay_name}",
         "PAL24": "🏦 PAL24 / PayPalych",
@@ -138,7 +139,8 @@ class BotConfigurationService:
         "YOOKASSA": "Интеграция с YooKassa: идентификаторы магазина и вебхуки.",
         "CRYPTOBOT": "CryptoBot и криптоплатежи через Telegram.",
         "HELEKET": "Heleket: криптоплатежи, ключи мерчанта и вебхуки.",
-        "PLATEGA": "Platega: merchant ID, секрет, ссылки возврата и методы оплаты.",
+        "CLOUDPAYMENTS": "CloudPayments: оплата банковскими картами, Public ID, API Secret и вебхуки.",
+        "PLATEGA": "{platega_name}: merchant ID, секрет, ссылки возврата и методы оплаты.",
         "MULENPAY": "Платежи {mulenpay_name} и параметры магазина.",
         "PAL24": "PAL24 / PayPalych подключения и лимиты.",
         "TRIBUTE": "Tribute и донат-сервисы.",
@@ -188,6 +190,8 @@ class BotConfigurationService:
             return value
         if category_key == "MULENPAY":
             return value.format(mulenpay_name=settings.get_mulenpay_display_name())
+        if category_key == "PLATEGA":
+            return value.format(platega_name=settings.get_platega_display_name())
         return value
 
     CATEGORY_KEY_OVERRIDES: Dict[str, str] = {
@@ -308,6 +312,7 @@ class BotConfigurationService:
         "YOOKASSA_": "YOOKASSA",
         "CRYPTOBOT_": "CRYPTOBOT",
         "HELEKET_": "HELEKET",
+        "CLOUDPAYMENTS_": "CLOUDPAYMENTS",
         "PLATEGA_": "PLATEGA",
         "MULENPAY_": "MULENPAY",
         "PAL24_": "PAL24",
@@ -350,6 +355,7 @@ class BotConfigurationService:
         "TRAFFIC_SELECTION_MODE": [
             ChoiceOption("selectable", "📦 Выбор пакетов"),
             ChoiceOption("fixed", "📏 Фиксированный лимит"),
+            ChoiceOption("fixed_with_topup", "📏 Фикс. лимит + докупка"),
         ],
         "DEFAULT_TRAFFIC_RESET_STRATEGY": [
             ChoiceOption("NO_RESET", "♾️ Без сброса"),
@@ -410,6 +416,12 @@ class BotConfigurationService:
             ChoiceOption(4, "4 — НДС 20%"),
             ChoiceOption(5, "5 — НДС 10/110"),
             ChoiceOption(6, "6 — НДС 20/120"),
+            ChoiceOption(7, "7 — НДС 5%"),
+            ChoiceOption(8, "8 — НДС 7%"),
+            ChoiceOption(9, "9 — НДС 5/105"),
+            ChoiceOption(10, "10 — НДС 7/107"),
+            ChoiceOption(11, "11 — НДС 22%"),
+            ChoiceOption(12, "12 — НДС 22/122"),
         ],
         "MULENPAY_LANGUAGE": [
             ChoiceOption("ru", "🇷🇺 Русский"),

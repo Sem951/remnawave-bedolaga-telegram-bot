@@ -128,17 +128,18 @@ async def create_paid_subscription(
     device_limit: Optional[int] = None,
     connected_squads: List[str] = None,
     update_server_counters: bool = False,
+    is_trial: bool = False,
 ) -> Subscription:
 
     end_date = datetime.utcnow() + timedelta(days=duration_days)
-    
+
     if device_limit is None:
         device_limit = settings.DEFAULT_DEVICE_LIMIT
 
     subscription = Subscription(
         user_id=user_id,
         status=SubscriptionStatus.ACTIVE.value,
-        is_trial=False,
+        is_trial=is_trial,
         start_date=datetime.utcnow(),
         end_date=end_date,
         traffic_limit_gb=traffic_limit_gb,
@@ -222,6 +223,7 @@ async def replace_subscription(
     subscription.end_date = current_time + timedelta(days=duration_days)
     subscription.traffic_limit_gb = traffic_limit_gb
     subscription.traffic_used_gb = 0.0
+    subscription.purchased_traffic_gb = 0  # Сбрасываем докупленный трафик при замене подписки
     subscription.device_limit = device_limit
     subscription.connected_squads = list(new_squads)
     subscription.subscription_url = None
@@ -339,7 +341,17 @@ async def extend_subscription(
 
     if settings.RESET_TRAFFIC_ON_PAYMENT:
         subscription.traffic_used_gb = 0.0
-        logger.info("🔄 Сбрасываем использованный трафик согласно настройке RESET_TRAFFIC_ON_PAYMENT")
+        subscription.purchased_traffic_gb = 0  # Сбрасываем докупленный трафик вместе с использованным
+        logger.info("🔄 Сбрасываем использованный и докупленный трафик согласно настройке RESET_TRAFFIC_ON_PAYMENT")
+
+    # В режиме fixed_with_topup при продлении сбрасываем трафик до фиксированного лимита
+    if settings.is_traffic_fixed() and days > 0:
+        fixed_limit = settings.get_fixed_traffic_limit()
+        old_limit = subscription.traffic_limit_gb
+        if subscription.traffic_limit_gb != fixed_limit or (subscription.purchased_traffic_gb or 0) > 0:
+            subscription.traffic_limit_gb = fixed_limit
+            subscription.purchased_traffic_gb = 0
+            logger.info(f"🔄 Сброс трафика при продлении (fixed_with_topup): {old_limit} ГБ → {fixed_limit} ГБ")
 
     subscription.updated_at = current_time
 
@@ -797,17 +809,17 @@ async def update_subscription_usage(
     return subscription
 
 async def get_all_subscriptions(
-    db: AsyncSession, 
-    page: int = 1, 
+    db: AsyncSession,
+    page: int = 1,
     limit: int = 10
 ) -> Tuple[List[Subscription], int]:
     count_result = await db.execute(
         select(func.count(Subscription.id))
     )
     total_count = count_result.scalar()
-    
+
     offset = (page - 1) * limit
-    
+
     result = await db.execute(
         select(Subscription)
         .options(selectinload(Subscription.user))
@@ -815,10 +827,26 @@ async def get_all_subscriptions(
         .offset(offset)
         .limit(limit)
     )
-    
+
     subscriptions = result.scalars().all()
-    
+
     return subscriptions, total_count
+
+
+async def get_subscriptions_batch(
+    db: AsyncSession,
+    offset: int = 0,
+    limit: int = 500,
+) -> List[Subscription]:
+    """Получает подписки пачками для синхронизации. Загружает связанных пользователей."""
+    result = await db.execute(
+        select(Subscription)
+        .options(selectinload(Subscription.user))
+        .order_by(Subscription.id)
+        .offset(offset)
+        .limit(limit)
+    )
+    return list(result.scalars().all())
 
 async def add_subscription_servers(
     db: AsyncSession,
@@ -1139,7 +1167,12 @@ async def get_subscription_renewal_cost(
         total_servers_cost = discounted_servers_per_month * months_in_period
         total_servers_discount = servers_discount_per_month * months_in_period
 
-        traffic_price_per_month = settings.get_traffic_price(subscription.traffic_limit_gb)
+        # В режиме fixed_with_topup при продлении используем фиксированный лимит
+        if settings.is_traffic_fixed():
+            renewal_traffic_gb = settings.get_fixed_traffic_limit()
+        else:
+            renewal_traffic_gb = subscription.traffic_limit_gb
+        traffic_price_per_month = settings.get_traffic_price(renewal_traffic_gb)
         traffic_discount_percent = _get_discount_percent(
             user,
             promo_group,
@@ -1396,8 +1429,11 @@ async def create_subscription_no_commit(
     )
     
     db.add(subscription)
+
+    # Выполняем flush, чтобы получить присвоенный первичный ключ
+    await db.flush()
+
     # Не коммитим сразу, оставляем для пакетной обработки
-    
     logger.info(f"✅ Подготовлена подписка для пользователя {user_id} (ожидает коммита)")
     return subscription
 
@@ -1465,10 +1501,15 @@ async def create_pending_subscription(
     device_limit: int = 1,
     connected_squads: List[str] = None,
     payment_method: str = "pending",
-    total_price_kopeks: int = 0
+    total_price_kopeks: int = 0,
+    is_trial: bool = False,
 ) -> Subscription:
-    """Creates a pending subscription that will be activated after payment."""
-    
+    """Creates a pending subscription that will be activated after payment.
+
+    Args:
+        is_trial: If True, marks the subscription as a trial subscription.
+    """
+    trial_label = "триальная " if is_trial else ""
     current_time = datetime.utcnow()
     end_date = current_time + timedelta(days=duration_days)
 
@@ -1480,13 +1521,14 @@ async def create_pending_subscription(
             and existing_subscription.end_date > current_time
         ):
             logger.warning(
-                "⚠️ Попытка создать pending подписку для активного пользователя %s. Возвращаем существующую запись.",
+                "⚠️ Попытка создать pending %sподписку для активного пользователя %s. Возвращаем существующую запись.",
+                trial_label,
                 user_id,
             )
             return existing_subscription
 
         existing_subscription.status = SubscriptionStatus.PENDING.value
-        existing_subscription.is_trial = False
+        existing_subscription.is_trial = is_trial
         existing_subscription.start_date = current_time
         existing_subscription.end_date = end_date
         existing_subscription.traffic_limit_gb = traffic_limit_gb
@@ -1499,7 +1541,8 @@ async def create_pending_subscription(
         await db.refresh(existing_subscription)
 
         logger.info(
-            "♻️ Обновлена ожидающая подписка пользователя %s, ID: %s, метод оплаты: %s",
+            "♻️ Обновлена ожидающая %sподписка пользователя %s, ID: %s, метод оплаты: %s",
+            trial_label,
             user_id,
             existing_subscription.id,
             payment_method,
@@ -1509,7 +1552,7 @@ async def create_pending_subscription(
     subscription = Subscription(
         user_id=user_id,
         status=SubscriptionStatus.PENDING.value,
-        is_trial=False,
+        is_trial=is_trial,
         start_date=current_time,
         end_date=end_date,
         traffic_limit_gb=traffic_limit_gb,
@@ -1518,19 +1561,45 @@ async def create_pending_subscription(
         autopay_enabled=settings.is_autopay_enabled_by_default(),
         autopay_days_before=settings.DEFAULT_AUTOPAY_DAYS_BEFORE,
     )
-    
+
     db.add(subscription)
     await db.commit()
     await db.refresh(subscription)
-    
+
     logger.info(
-        "💳 Создана ожидающая подписка для пользователя %s, ID: %s, метод оплаты: %s",
+        "💳 Создана ожидающая %sподписка для пользователя %s, ID: %s, метод оплаты: %s",
+        trial_label,
         user_id,
         subscription.id,
         payment_method,
     )
-    
+
     return subscription
+
+
+# Обратная совместимость: алиас для триальной подписки
+async def create_pending_trial_subscription(
+    db: AsyncSession,
+    user_id: int,
+    duration_days: int,
+    traffic_limit_gb: int = 0,
+    device_limit: int = 1,
+    connected_squads: List[str] = None,
+    payment_method: str = "pending",
+    total_price_kopeks: int = 0,
+) -> Subscription:
+    """Creates a pending trial subscription. Wrapper for create_pending_subscription with is_trial=True."""
+    return await create_pending_subscription(
+        db=db,
+        user_id=user_id,
+        duration_days=duration_days,
+        traffic_limit_gb=traffic_limit_gb,
+        device_limit=device_limit,
+        connected_squads=connected_squads,
+        payment_method=payment_method,
+        total_price_kopeks=total_price_kopeks,
+        is_trial=True,
+    )
 
 
 async def activate_pending_subscription(
@@ -1539,8 +1608,6 @@ async def activate_pending_subscription(
     period_days: int = None
 ) -> Optional[Subscription]:
     """Активирует pending подписку пользователя, меняя её статус на ACTIVE."""
-    from sqlalchemy import and_
-    
     logger.info(f"Активация pending подписки: пользователь {user_id}, период {period_days} дней")
     
     # Находим pending подписку пользователя

@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time, date
 from typing import Optional, List, Dict, Any
 from enum import Enum
 
@@ -7,6 +7,8 @@ from sqlalchemy import (
     Integer,
     String,
     DateTime,
+    Date,
+    Time,
     Boolean,
     Text,
     ForeignKey,
@@ -16,6 +18,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Index,
     Table,
+    SmallInteger,
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, Mapped, mapped_column
@@ -83,6 +86,7 @@ class PaymentMethod(Enum):
     PAL24 = "pal24"
     WATA = "wata"
     PLATEGA = "platega"
+    CLOUDPAYMENTS = "cloudpayments"
     MANUAL = "manual"
 
 
@@ -465,6 +469,82 @@ class PlategaPayment(Base):
         )
 
 
+class CloudPaymentsPayment(Base):
+    __tablename__ = "cloudpayments_payments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    # CloudPayments идентификаторы
+    transaction_id_cp = Column(Integer, unique=True, nullable=True, index=True)  # TransactionId от CloudPayments
+    invoice_id = Column(String(255), unique=True, nullable=False, index=True)  # Наш InvoiceId
+
+    amount_kopeks = Column(Integer, nullable=False)
+    currency = Column(String(10), nullable=False, default="RUB")
+    description = Column(Text, nullable=True)
+
+    status = Column(String(50), nullable=False, default="pending")  # pending, completed, failed, authorized
+    is_paid = Column(Boolean, default=False)
+    paid_at = Column(DateTime, nullable=True)
+
+    # Данные карты (маскированные)
+    card_first_six = Column(String(6), nullable=True)
+    card_last_four = Column(String(4), nullable=True)
+    card_type = Column(String(50), nullable=True)  # Visa, MasterCard, etc.
+    card_exp_date = Column(String(10), nullable=True)  # MM/YY
+
+    # Токен для рекуррентных платежей
+    token = Column(String(255), nullable=True)
+
+    # URL для оплаты (виджет)
+    payment_url = Column(Text, nullable=True)
+
+    # Email плательщика
+    email = Column(String(255), nullable=True)
+
+    # Тестовый режим
+    test_mode = Column(Boolean, default=False)
+
+    # Дополнительные данные
+    metadata_json = Column(JSON, nullable=True)
+    callback_payload = Column(JSON, nullable=True)
+
+    # Связь с транзакцией в нашей системе
+    transaction_id = Column(Integer, ForeignKey("transactions.id"), nullable=True)
+
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    user = relationship("User", backref="cloudpayments_payments")
+    transaction = relationship("Transaction", backref="cloudpayments_payment")
+
+    @property
+    def amount_rubles(self) -> float:
+        return self.amount_kopeks / 100
+
+    @property
+    def is_pending(self) -> bool:
+        return self.status == "pending"
+
+    @property
+    def is_completed(self) -> bool:
+        return self.status == "completed" and self.is_paid
+
+    @property
+    def is_failed(self) -> bool:
+        return self.status == "failed"
+
+    def __repr__(self) -> str:  # pragma: no cover - debug helper
+        return (
+            "<CloudPaymentsPayment(id={0}, invoice={1}, amount={2}₽, status={3})>".format(
+                self.id,
+                self.invoice_id,
+                self.amount_rubles,
+                self.status,
+            )
+        )
+
+
 class PromoGroup(Base):
     __tablename__ = "promo_groups"
 
@@ -608,6 +688,17 @@ class User(Base):
     promo_group = relationship("PromoGroup", back_populates="users")
     user_promo_groups = relationship("UserPromoGroup", back_populates="user", cascade="all, delete-orphan")
     poll_responses = relationship("PollResponse", back_populates="user")
+    last_pinned_message_id = Column(Integer, nullable=True)
+
+    # Ограничения пользователя
+    restriction_topup = Column(Boolean, default=False, nullable=False)  # Запрет пополнения
+    restriction_subscription = Column(Boolean, default=False, nullable=False)  # Запрет продления/покупки
+    restriction_reason = Column(String(500), nullable=True)  # Причина ограничения
+
+    @property
+    def has_restrictions(self) -> bool:
+        """Проверить, есть ли у пользователя активные ограничения."""
+        return self.restriction_topup or self.restriction_subscription
 
     @property
     def balance_rubles(self) -> float:
@@ -674,11 +765,13 @@ class Subscription(Base):
     
     traffic_limit_gb = Column(Integer, default=0)
     traffic_used_gb = Column(Float, default=0.0)
+    purchased_traffic_gb = Column(Integer, default=0)  # Докупленный трафик (для расчета цены сброса)
 
     subscription_url = Column(String, nullable=True)
     subscription_crypto_link = Column(String, nullable=True)
 
     device_limit = Column(Integer, default=1)
+    modem_enabled = Column(Boolean, default=False)
     
     connected_squads = Column(JSON, default=list)
     
@@ -837,10 +930,14 @@ class Transaction(Base):
     description = Column(Text, nullable=True)
     
     payment_method = Column(String(50), nullable=True)
-    external_id = Column(String(255), nullable=True)  
-    
+    external_id = Column(String(255), nullable=True)
+
     is_completed = Column(Boolean, default=True)
-    
+
+    # NaloGO чек
+    receipt_uuid = Column(String(255), nullable=True, index=True)
+    receipt_created_at = Column(DateTime, nullable=True)
+
     created_at = Column(DateTime, default=func.now())
     completed_at = Column(DateTime, nullable=True)
     
@@ -955,6 +1052,133 @@ class ReferralEarning(Base):
     @property
     def amount_rubles(self) -> float:
         return self.amount_kopeks / 100
+
+
+class ReferralContest(Base):
+    __tablename__ = "referral_contests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    prize_text = Column(Text, nullable=True)
+    contest_type = Column(String(50), nullable=False, default="referral_paid")
+    start_at = Column(DateTime, nullable=False)
+    end_at = Column(DateTime, nullable=False)
+    daily_summary_time = Column(Time, nullable=False, default=time(hour=12, minute=0))
+    daily_summary_times = Column(String(255), nullable=True)  # CSV HH:MM
+    timezone = Column(String(64), nullable=False, default="UTC")
+    is_active = Column(Boolean, nullable=False, default=True)
+    last_daily_summary_date = Column(Date, nullable=True)
+    last_daily_summary_at = Column(DateTime, nullable=True)
+    final_summary_sent = Column(Boolean, nullable=False, default=False)
+    created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    creator = relationship("User", backref="created_referral_contests")
+    events = relationship(
+        "ReferralContestEvent",
+        back_populates="contest",
+        cascade="all, delete-orphan",
+    )
+
+    def __repr__(self):
+        return f"<ReferralContest id={self.id} title='{self.title}'>"
+
+
+class ReferralContestEvent(Base):
+    __tablename__ = "referral_contest_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "contest_id",
+            "referral_id",
+            name="uq_referral_contest_referral",
+        ),
+        Index("idx_referral_contest_referrer", "contest_id", "referrer_id"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    contest_id = Column(Integer, ForeignKey("referral_contests.id", ondelete="CASCADE"), nullable=False)
+    referrer_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    referral_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    event_type = Column(String(50), nullable=False)
+    amount_kopeks = Column(Integer, nullable=False, default=0)
+    occurred_at = Column(DateTime, nullable=False, default=func.now())
+
+    contest = relationship("ReferralContest", back_populates="events")
+    referrer = relationship("User", foreign_keys=[referrer_id])
+    referral = relationship("User", foreign_keys=[referral_id])
+
+    def __repr__(self):
+        return (
+            f"<ReferralContestEvent contest={self.contest_id} "
+            f"referrer={self.referrer_id} referral={self.referral_id}>"
+        )
+
+
+class ContestTemplate(Base):
+    __tablename__ = "contest_templates"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False)
+    slug = Column(String(50), nullable=False, unique=True, index=True)
+    description = Column(Text, nullable=True)
+    prize_type = Column(String(20), nullable=False, default="days")
+    prize_value = Column(String(50), nullable=False, default="1")
+    max_winners = Column(Integer, nullable=False, default=1)
+    attempts_per_user = Column(Integer, nullable=False, default=1)
+    times_per_day = Column(Integer, nullable=False, default=1)
+    schedule_times = Column(String(255), nullable=True)  # CSV of HH:MM in local TZ
+    cooldown_hours = Column(Integer, nullable=False, default=24)
+    payload = Column(JSON, nullable=True)
+    is_enabled = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    rounds = relationship("ContestRound", back_populates="template")
+
+
+class ContestRound(Base):
+    __tablename__ = "contest_rounds"
+    __table_args__ = (
+        Index("idx_contest_round_status", "status"),
+        Index("idx_contest_round_template", "template_id"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    template_id = Column(Integer, ForeignKey("contest_templates.id", ondelete="CASCADE"), nullable=False)
+    starts_at = Column(DateTime, nullable=False)
+    ends_at = Column(DateTime, nullable=False)
+    status = Column(String(20), nullable=False, default="active")  # active, finished
+    payload = Column(JSON, nullable=True)
+    winners_count = Column(Integer, nullable=False, default=0)
+    max_winners = Column(Integer, nullable=False, default=1)
+    attempts_per_user = Column(Integer, nullable=False, default=1)
+    message_id = Column(BigInteger, nullable=True)
+    chat_id = Column(BigInteger, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    template = relationship("ContestTemplate", back_populates="rounds")
+    attempts = relationship("ContestAttempt", back_populates="round", cascade="all, delete-orphan")
+
+
+class ContestAttempt(Base):
+    __tablename__ = "contest_attempts"
+    __table_args__ = (
+        UniqueConstraint("round_id", "user_id", name="uq_round_user_attempt"),
+        Index("idx_contest_attempt_round", "round_id"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    round_id = Column(Integer, ForeignKey("contest_rounds.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    answer = Column(Text, nullable=True)
+    is_winner = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=func.now())
+
+    round = relationship("ContestRound", back_populates="attempts")
+    user = relationship("User")
 
 
 class Squad(Base):
@@ -1424,6 +1648,23 @@ class WelcomeText(Base):
     creator = relationship("User", backref="created_welcome_texts")
 
 
+class PinnedMessage(Base):
+    __tablename__ = "pinned_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    content = Column(Text, nullable=False, default="")
+    media_type = Column(String(32), nullable=True)
+    media_file_id = Column(String(255), nullable=True)
+    send_before_menu = Column(Boolean, nullable=False, server_default="1", default=True)
+    send_on_every_start = Column(Boolean, nullable=False, server_default="1", default=True)
+    is_active = Column(Boolean, default=True)
+    created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    creator = relationship("User", backref="pinned_messages")
+
+
 class AdvertisingCampaign(Base):
     __tablename__ = "advertising_campaigns"
 
@@ -1653,3 +1894,48 @@ class MainMenuButton(Base):
             f"<MainMenuButton id={self.id} text='{self.text}' "
             f"action={self.action_type} visibility={self.visibility} active={self.is_active}>"
         )
+
+
+class MenuLayoutHistory(Base):
+    """История изменений конфигурации меню."""
+    __tablename__ = "menu_layout_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    config_json = Column(Text, nullable=False)  # Полная конфигурация в JSON
+    action = Column(String(50), nullable=False)  # update, reset, import
+    changes_summary = Column(Text, nullable=True)  # Краткое описание изменений
+    user_info = Column(String(255), nullable=True)  # Информация о пользователе/токене
+    created_at = Column(DateTime, default=func.now(), index=True)
+
+    __table_args__ = (
+        Index("ix_menu_layout_history_created", "created_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<MenuLayoutHistory id={self.id} action='{self.action}' created_at={self.created_at}>"
+
+
+class ButtonClickLog(Base):
+    """Логи кликов по кнопкам меню."""
+    __tablename__ = "button_click_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    button_id = Column(String(100), nullable=False, index=True)  # ID кнопки
+    user_id = Column(BigInteger, ForeignKey("users.telegram_id", ondelete="SET NULL"), nullable=True, index=True)
+    callback_data = Column(String(255), nullable=True)  # callback_data кнопки
+    clicked_at = Column(DateTime, default=func.now(), index=True)
+
+    # Дополнительная информация
+    button_type = Column(String(20), nullable=True)  # builtin, callback, url, mini_app
+    button_text = Column(String(255), nullable=True)  # Текст кнопки на момент клика
+
+    __table_args__ = (
+        Index("ix_button_click_logs_button_date", "button_id", "clicked_at"),
+        Index("ix_button_click_logs_user_date", "user_id", "clicked_at"),
+    )
+
+    # Связи
+    user = relationship("User", foreign_keys=[user_id])
+
+    def __repr__(self) -> str:
+        return f"<ButtonClickLog id={self.id} button='{self.button_id}' user={self.user_id} at={self.clicked_at}>"

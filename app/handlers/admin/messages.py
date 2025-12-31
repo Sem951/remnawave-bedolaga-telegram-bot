@@ -1,3 +1,4 @@
+import html
 import logging
 import asyncio
 from datetime import datetime, timedelta
@@ -25,13 +26,19 @@ from app.keyboards.admin import (
     get_admin_pagination_keyboard, get_broadcast_media_keyboard,
     get_media_confirm_keyboard, get_updated_message_buttons_selector_keyboard_with_media,
     BROADCAST_BUTTON_ROWS, DEFAULT_BROADCAST_BUTTONS,
-    get_broadcast_button_config, get_broadcast_button_labels
+    get_broadcast_button_config, get_broadcast_button_labels, get_pinned_message_keyboard
 )
 from app.localization.texts import get_texts
 from app.database.crud.user import get_users_list
 from app.database.crud.subscription import get_expiring_subscriptions
 from app.utils.decorators import admin_required, error_handler
 from app.utils.miniapp_buttons import build_miniapp_or_callback_button
+from app.services.pinned_message_service import (
+    broadcast_pinned_message,
+    get_active_pinned_message,
+    set_active_pinned_message,
+    unpin_active_pinned_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +172,302 @@ async def show_messages_menu(
         parse_mode="HTML"  
     )
     await callback.answer()
+
+
+@admin_required
+@error_handler
+async def show_pinned_message_menu(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+    state: FSMContext,
+):
+    await state.clear()
+    pinned_message = await get_active_pinned_message(db)
+
+    if pinned_message:
+        content_preview = html.escape(pinned_message.content or "")
+        last_updated = pinned_message.updated_at or pinned_message.created_at
+        timestamp_text = last_updated.strftime("%d.%m.%Y %H:%M") if last_updated else "—"
+        media_line = ""
+        if pinned_message.media_type:
+            media_label = "Фото" if pinned_message.media_type == "photo" else "Видео"
+            media_line = f"📎 Медиа: {media_label}\n"
+        position_line = (
+            "⬆️ Отправлять перед меню"
+            if pinned_message.send_before_menu
+            else "⬇️ Отправлять после меню"
+        )
+        start_mode_line = (
+            "🔁 При каждом /start"
+            if pinned_message.send_on_every_start
+            else "🚫 Только один раз и при обновлении"
+        )
+        body = (
+            "📌 <b>Закрепленное сообщение</b>\n\n"
+            "📝 Текущий текст:\n"
+            f"<code>{content_preview}</code>\n\n"
+            f"{media_line}"
+            f"{position_line}\n"
+            f"{start_mode_line}\n"
+            f"🕒 Обновлено: {timestamp_text}"
+        )
+    else:
+        body = (
+            "📌 <b>Закрепленное сообщение</b>\n\n"
+            "Сообщение не задано. Отправьте новый текст, чтобы разослать и закрепить его у пользователей."
+        )
+
+    await callback.message.edit_text(
+        body,
+        reply_markup=get_pinned_message_keyboard(
+            db_user.language,
+            send_before_menu=getattr(pinned_message, "send_before_menu", True),
+            send_on_every_start=getattr(pinned_message, "send_on_every_start", True),
+        ),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@admin_required
+@error_handler
+async def prompt_pinned_message_update(
+    callback: types.CallbackQuery,
+    db_user: User,
+    state: FSMContext,
+):
+    await state.set_state(AdminStates.editing_pinned_message)
+    await callback.message.edit_text(
+        "✏️ <b>Новое закрепленное сообщение</b>\n\n"
+        "Пришлите текст, фото или видео, которое нужно закрепить.\n"
+        "Бот отправит его всем активным пользователям, открепит старое и закрепит новое без уведомлений.",
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="❌ Отмена", callback_data="admin_pinned_message")]
+        ]),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@admin_required
+@error_handler
+async def toggle_pinned_message_position(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+    state: FSMContext,
+):
+    pinned_message = await get_active_pinned_message(db)
+    if not pinned_message:
+        await callback.answer("Сначала задайте закрепленное сообщение", show_alert=True)
+        return
+
+    pinned_message.send_before_menu = not pinned_message.send_before_menu
+    pinned_message.updated_at = datetime.utcnow()
+    await db.commit()
+
+    await show_pinned_message_menu(callback, db_user, db, state)
+
+
+@admin_required
+@error_handler
+async def toggle_pinned_message_start_mode(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+    state: FSMContext,
+):
+    pinned_message = await get_active_pinned_message(db)
+    if not pinned_message:
+        await callback.answer("Сначала задайте закрепленное сообщение", show_alert=True)
+        return
+
+    pinned_message.send_on_every_start = not pinned_message.send_on_every_start
+    pinned_message.updated_at = datetime.utcnow()
+    await db.commit()
+
+    await show_pinned_message_menu(callback, db_user, db, state)
+
+
+@admin_required
+@error_handler
+async def delete_pinned_message(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+    state: FSMContext,
+):
+    pinned_message = await get_active_pinned_message(db)
+    if not pinned_message:
+        await callback.answer("Закрепленное сообщение уже отсутствует", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "🗑️ <b>Удаление закрепленного сообщения</b>\n\n"
+        "Подождите, пока бот открепит сообщение у пользователей...",
+        parse_mode="HTML",
+    )
+
+    unpinned_count, failed_count, deleted = await unpin_active_pinned_message(
+        callback.bot,
+        db,
+    )
+
+    if not deleted:
+        await callback.message.edit_text(
+            "❌ Не удалось найти активное закрепленное сообщение для удаления",
+            reply_markup=get_admin_messages_keyboard(db_user.language),
+            parse_mode="HTML",
+        )
+        await state.clear()
+        return
+
+    total = unpinned_count + failed_count
+    await callback.message.edit_text(
+        "✅ <b>Закрепленное сообщение удалено</b>\n\n"
+        f"👥 Чатов обработано: {total}\n"
+        f"✅ Откреплено: {unpinned_count}\n"
+        f"⚠️ Ошибок: {failed_count}\n\n"
+        "Новое сообщение можно задать кнопкой \"Обновить\".",
+        reply_markup=get_admin_messages_keyboard(db_user.language),
+        parse_mode="HTML",
+    )
+    await state.clear()
+
+
+@admin_required
+@error_handler
+async def process_pinned_message_update(
+    message: types.Message,
+    db_user: User,
+    state: FSMContext,
+    db: AsyncSession,
+):
+    texts = get_texts(db_user.language)
+    media_type: Optional[str] = None
+    media_file_id: Optional[str] = None
+
+    if message.photo:
+        media_type = "photo"
+        media_file_id = message.photo[-1].file_id
+    elif message.video:
+        media_type = "video"
+        media_file_id = message.video.file_id
+
+    pinned_text = message.html_text or message.caption_html or message.text or message.caption or ""
+
+    if not pinned_text and not media_file_id:
+        await message.answer(
+            texts.t("ADMIN_PINNED_NO_CONTENT", "❌ Не удалось прочитать текст или медиа в сообщении, попробуйте снова.")
+        )
+        return
+
+    try:
+        pinned_message = await set_active_pinned_message(
+            db,
+            pinned_text,
+            db_user.id,
+            media_type=media_type,
+            media_file_id=media_file_id,
+        )
+    except ValueError as validation_error:
+        await message.answer(f"❌ {validation_error}")
+        return
+
+    # Сообщение сохранено, спрашиваем о рассылке
+    from app.keyboards.admin import get_pinned_broadcast_confirm_keyboard
+    from app.states import AdminStates
+
+    await message.answer(
+        texts.t(
+            "ADMIN_PINNED_SAVED_ASK_BROADCAST",
+            "📌 <b>Сообщение сохранено!</b>\n\n"
+            "Выберите, как доставить сообщение пользователям:\n\n"
+            "• <b>Разослать сейчас</b> — отправит и закрепит у всех активных пользователей\n"
+            "• <b>Только при /start</b> — пользователи увидят при следующем запуске бота",
+        ),
+        reply_markup=get_pinned_broadcast_confirm_keyboard(db_user.language, pinned_message.id),
+        parse_mode="HTML",
+    )
+    await state.set_state(AdminStates.confirming_pinned_broadcast)
+
+
+@admin_required
+@error_handler
+async def handle_pinned_broadcast_now(
+    callback: types.CallbackQuery,
+    db_user: User,
+    state: FSMContext,
+    db: AsyncSession,
+):
+    """Разослать закреплённое сообщение сейчас всем пользователям."""
+    texts = get_texts(db_user.language)
+
+    # Получаем ID сообщения из callback_data
+    pinned_message_id = int(callback.data.split(":")[1])
+
+    # Получаем сообщение из БД
+    from sqlalchemy import select
+    from app.database.models import PinnedMessage
+
+    result = await db.execute(
+        select(PinnedMessage).where(PinnedMessage.id == pinned_message_id)
+    )
+    pinned_message = result.scalar_one_or_none()
+
+    if not pinned_message:
+        await callback.answer("❌ Сообщение не найдено", show_alert=True)
+        await state.clear()
+        return
+
+    await callback.message.edit_text(
+        texts.t("ADMIN_PINNED_SAVING", "📌 Сообщение сохранено. Начинаю отправку и закрепление у пользователей..."),
+        parse_mode="HTML",
+    )
+
+    sent_count, failed_count = await broadcast_pinned_message(
+        callback.bot,
+        db,
+        pinned_message,
+    )
+
+    total = sent_count + failed_count
+    await callback.message.edit_text(
+        texts.t(
+            "ADMIN_PINNED_UPDATED",
+            "✅ <b>Закрепленное сообщение обновлено</b>\n\n"
+            "👥 Получателей: {total}\n"
+            "✅ Отправлено: {sent}\n"
+            "⚠️ Ошибок: {failed}",
+        ).format(total=total, sent=sent_count, failed=failed_count),
+        reply_markup=get_admin_messages_keyboard(db_user.language),
+        parse_mode="HTML",
+    )
+    await state.clear()
+
+
+@admin_required
+@error_handler
+async def handle_pinned_broadcast_skip(
+    callback: types.CallbackQuery,
+    db_user: User,
+    state: FSMContext,
+    db: AsyncSession,
+):
+    """Пропустить рассылку — пользователи увидят при /start."""
+    texts = get_texts(db_user.language)
+
+    await callback.message.edit_text(
+        texts.t(
+            "ADMIN_PINNED_SAVED_NO_BROADCAST",
+            "✅ <b>Закрепленное сообщение сохранено</b>\n\n"
+            "Рассылка не выполнена. Пользователи увидят сообщение при следующем вводе /start.",
+        ),
+        reply_markup=get_admin_messages_keyboard(db_user.language),
+        parse_mode="HTML",
+    )
+    await state.clear()
 
 
 @admin_required
@@ -408,29 +711,56 @@ async def handle_media_selection(
         await state.update_data(has_media=False)
         await show_button_selector_callback(callback, db_user, state)
         return
-    
+
     media_type = callback.data.replace('add_media_', '')
-    
+
     media_instructions = {
         "photo": "📷 Отправьте фотографию для рассылки:",
         "video": "🎥 Отправьте видео для рассылки:",
         "document": "📄 Отправьте документ для рассылки:"
     }
-    
+
     await state.update_data(
         media_type=media_type,
         waiting_for_media=True
     )
-    
-    await callback.message.edit_text(
+
+    instruction_text = (
         f"{media_instructions.get(media_type, 'Отправьте медиафайл:')}\n\n"
-        f"<i>Размер файла не должен превышать 50 МБ</i>",
-        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="❌ Отмена", callback_data="admin_messages")]
-        ]),
-        parse_mode="HTML"
+        f"<i>Размер файла не должен превышать 50 МБ</i>"
     )
-    
+    instruction_keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="❌ Отмена", callback_data="admin_messages")]
+    ])
+
+    # Проверяем, является ли текущее сообщение медиа-сообщением
+    is_media_message = (
+        callback.message.photo
+        or callback.message.video
+        or callback.message.document
+        or callback.message.animation
+        or callback.message.audio
+        or callback.message.voice
+    )
+
+    if is_media_message:
+        # Удаляем медиа-сообщение и отправляем новое текстовое
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await callback.message.answer(
+            instruction_text,
+            reply_markup=instruction_keyboard,
+            parse_mode="HTML"
+        )
+    else:
+        await callback.message.edit_text(
+            instruction_text,
+            reply_markup=instruction_keyboard,
+            parse_mode="HTML"
+        )
+
     await state.set_state(AdminStates.waiting_for_broadcast_media)
     await callback.answer()
 
@@ -557,12 +887,12 @@ async def show_button_selector_callback(
     if selected_buttons is None:
         selected_buttons = list(DEFAULT_SELECTED_BUTTONS)
         await state.update_data(selected_buttons=selected_buttons)
-    
+
     media_info = ""
     if has_media:
         media_type = data.get('media_type', 'файл')
         media_info = f"\n🖼️ <b>Медиафайл:</b> {media_type} добавлен"
-    
+
     text = f"""
 📘 <b>Выбор дополнительных кнопок</b>
 
@@ -579,16 +909,39 @@ async def show_button_selector_callback(
 
 Выберите нужные кнопки и нажмите "Продолжить":
 """
-    
+
     keyboard = get_updated_message_buttons_selector_keyboard_with_media(
         selected_buttons, has_media, db_user.language
     )
-    
-    await callback.message.edit_text(
-        text,
-        reply_markup=keyboard,
-        parse_mode="HTML"
+
+    # Проверяем, является ли текущее сообщение медиа-сообщением
+    # (фото, видео, документ и т.д.) - для них нельзя использовать edit_text
+    is_media_message = (
+        callback.message.photo
+        or callback.message.video
+        or callback.message.document
+        or callback.message.animation
+        or callback.message.audio
+        or callback.message.voice
     )
+
+    if is_media_message:
+        # Удаляем медиа-сообщение и отправляем новое текстовое
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass  # Игнорируем ошибки удаления
+        await callback.message.answer(
+            text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+    else:
+        await callback.message.edit_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
     await callback.answer()
 
 
@@ -1047,6 +1400,106 @@ async def get_target_users(db: AsyncSession, target: str) -> list:
             and (user.subscription.traffic_used_gb or 0) <= 0
         ]
 
+    if target == "expiring_subscribers":
+        expiring_subs = await get_expiring_subscriptions(db, 7)
+        return [sub.user for sub in expiring_subs if sub.user]
+
+    if target == "expired_subscribers":
+        now = datetime.utcnow()
+        expired_statuses = {
+            SubscriptionStatus.EXPIRED.value,
+            SubscriptionStatus.DISABLED.value,
+        }
+        expired_users = []
+        for user in users:
+            subscription = user.subscription
+            if subscription:
+                if subscription.status in expired_statuses:
+                    expired_users.append(user)
+                    continue
+                if subscription.end_date <= now and not subscription.is_active:
+                    expired_users.append(user)
+                    continue
+            elif user.has_had_paid_subscription:
+                expired_users.append(user)
+        return expired_users
+
+    if target == "canceled_subscribers":
+        return [
+            user
+            for user in users
+            if user.subscription
+            and user.subscription.status == SubscriptionStatus.DISABLED.value
+        ]
+
+    if target == "trial_ending":
+        now = datetime.utcnow()
+        in_3_days = now + timedelta(days=3)
+        return [
+            user
+            for user in users
+            if user.subscription
+            and user.subscription.is_trial
+            and user.subscription.is_active
+            and user.subscription.end_date <= in_3_days
+        ]
+
+    if target == "trial_expired":
+        now = datetime.utcnow()
+        return [
+            user
+            for user in users
+            if user.subscription
+            and user.subscription.is_trial
+            and user.subscription.end_date <= now
+        ]
+
+    if target == "autopay_failed":
+        from app.database.models import SubscriptionEvent
+        week_ago = datetime.utcnow() - timedelta(days=7)
+        stmt = select(SubscriptionEvent.user_id).where(
+            and_(
+                SubscriptionEvent.event_type == "autopay_failed",
+                SubscriptionEvent.occurred_at >= week_ago,
+            )
+        ).distinct()
+        result = await db.execute(stmt)
+        failed_user_ids = set(result.scalars().all())
+        return [user for user in users if user.id in failed_user_ids]
+
+    if target == "low_balance":
+        threshold_kopeks = 10000  # 100 рублей
+        return [
+            user
+            for user in users
+            if (user.balance_kopeks or 0) < threshold_kopeks
+            and (user.balance_kopeks or 0) > 0
+        ]
+
+    if target == "inactive_30d":
+        threshold = datetime.utcnow() - timedelta(days=30)
+        return [
+            user
+            for user in users
+            if user.last_activity and user.last_activity < threshold
+        ]
+
+    if target == "inactive_60d":
+        threshold = datetime.utcnow() - timedelta(days=60)
+        return [
+            user
+            for user in users
+            if user.last_activity and user.last_activity < threshold
+        ]
+
+    if target == "inactive_90d":
+        threshold = datetime.utcnow() - timedelta(days=90)
+        return [
+            user
+            for user in users
+            if user.last_activity and user.last_activity < threshold
+        ]
+
     return []
 
 
@@ -1195,6 +1648,13 @@ def get_target_display_name(target: str) -> str:
 
 def register_handlers(dp: Dispatcher):
     dp.callback_query.register(show_messages_menu, F.data == "admin_messages")
+    dp.callback_query.register(show_pinned_message_menu, F.data == "admin_pinned_message")
+    dp.callback_query.register(toggle_pinned_message_position, F.data == "admin_pinned_message_position")
+    dp.callback_query.register(toggle_pinned_message_start_mode, F.data == "admin_pinned_message_start_mode")
+    dp.callback_query.register(delete_pinned_message, F.data == "admin_pinned_message_delete")
+    dp.callback_query.register(prompt_pinned_message_update, F.data == "admin_pinned_message_edit")
+    dp.callback_query.register(handle_pinned_broadcast_now, F.data.startswith("admin_pinned_broadcast_now:"))
+    dp.callback_query.register(handle_pinned_broadcast_skip, F.data.startswith("admin_pinned_broadcast_skip:"))
     dp.callback_query.register(show_broadcast_targets, F.data.in_(["admin_msg_all", "admin_msg_by_sub"]))
     dp.callback_query.register(select_broadcast_target, F.data.startswith("broadcast_"))
     dp.callback_query.register(confirm_broadcast, F.data == "admin_confirm_broadcast")
@@ -1212,3 +1672,4 @@ def register_handlers(dp: Dispatcher):
     dp.callback_query.register(handle_change_media, F.data == "change_media")
     dp.message.register(process_broadcast_message, AdminStates.waiting_for_broadcast_message)
     dp.message.register(process_broadcast_media, AdminStates.waiting_for_broadcast_media)
+    dp.message.register(process_pinned_message_update, AdminStates.editing_pinned_message)
