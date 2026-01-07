@@ -1289,6 +1289,118 @@ async def ensure_wata_payment_schema() -> bool:
         return False
 
 
+async def create_freekassa_payments_table():
+    """Создаёт таблицу freekassa_payments для платежей через Freekassa."""
+    table_exists = await check_table_exists('freekassa_payments')
+    if table_exists:
+        logger.info("Таблица freekassa_payments уже существует")
+        return True
+
+    try:
+        async with engine.begin() as conn:
+            db_type = await get_database_type()
+
+            if db_type == 'sqlite':
+                create_sql = """
+                CREATE TABLE freekassa_payments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    order_id VARCHAR(64) NOT NULL UNIQUE,
+                    freekassa_order_id VARCHAR(64) NULL UNIQUE,
+                    amount_kopeks INTEGER NOT NULL,
+                    currency VARCHAR(10) NOT NULL DEFAULT 'RUB',
+                    description TEXT NULL,
+                    status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                    is_paid BOOLEAN NOT NULL DEFAULT 0,
+                    payment_url TEXT NULL,
+                    payment_system_id INTEGER NULL,
+                    metadata_json JSON NULL,
+                    callback_payload JSON NULL,
+                    paid_at DATETIME NULL,
+                    expires_at DATETIME NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    transaction_id INTEGER NULL,
+                    FOREIGN KEY (user_id) REFERENCES users(id),
+                    FOREIGN KEY (transaction_id) REFERENCES transactions(id)
+                );
+
+                CREATE INDEX idx_freekassa_user_id ON freekassa_payments(user_id);
+                CREATE UNIQUE INDEX idx_freekassa_order_id ON freekassa_payments(order_id);
+                CREATE UNIQUE INDEX idx_freekassa_fk_order_id ON freekassa_payments(freekassa_order_id);
+                """
+
+            elif db_type == 'postgresql':
+                create_sql = """
+                CREATE TABLE freekassa_payments (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    order_id VARCHAR(64) NOT NULL UNIQUE,
+                    freekassa_order_id VARCHAR(64) NULL UNIQUE,
+                    amount_kopeks INTEGER NOT NULL,
+                    currency VARCHAR(10) NOT NULL DEFAULT 'RUB',
+                    description TEXT NULL,
+                    status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                    is_paid BOOLEAN NOT NULL DEFAULT FALSE,
+                    payment_url TEXT NULL,
+                    payment_system_id INTEGER NULL,
+                    metadata_json JSON NULL,
+                    callback_payload JSON NULL,
+                    paid_at TIMESTAMP NULL,
+                    expires_at TIMESTAMP NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    transaction_id INTEGER NULL REFERENCES transactions(id)
+                );
+
+                CREATE INDEX idx_freekassa_user_id ON freekassa_payments(user_id);
+                CREATE UNIQUE INDEX idx_freekassa_order_id ON freekassa_payments(order_id);
+                CREATE UNIQUE INDEX idx_freekassa_fk_order_id ON freekassa_payments(freekassa_order_id);
+                """
+
+            elif db_type == 'mysql':
+                create_sql = """
+                CREATE TABLE freekassa_payments (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    order_id VARCHAR(64) NOT NULL UNIQUE,
+                    freekassa_order_id VARCHAR(64) NULL UNIQUE,
+                    amount_kopeks INT NOT NULL,
+                    currency VARCHAR(10) NOT NULL DEFAULT 'RUB',
+                    description TEXT NULL,
+                    status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                    is_paid BOOLEAN NOT NULL DEFAULT 0,
+                    payment_url TEXT NULL,
+                    payment_system_id INT NULL,
+                    metadata_json JSON NULL,
+                    callback_payload JSON NULL,
+                    paid_at DATETIME NULL,
+                    expires_at DATETIME NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    transaction_id INT NULL,
+                    FOREIGN KEY (user_id) REFERENCES users(id),
+                    FOREIGN KEY (transaction_id) REFERENCES transactions(id)
+                );
+
+                CREATE INDEX idx_freekassa_user_id ON freekassa_payments(user_id);
+                CREATE UNIQUE INDEX idx_freekassa_order_id ON freekassa_payments(order_id);
+                CREATE UNIQUE INDEX idx_freekassa_fk_order_id ON freekassa_payments(freekassa_order_id);
+                """
+
+            else:
+                logger.error(f"Неподдерживаемый тип БД для таблицы freekassa_payments: {db_type}")
+                return False
+
+            await conn.execute(text(create_sql))
+            logger.info("Таблица freekassa_payments успешно создана")
+            return True
+
+    except Exception as e:
+        logger.error(f"Ошибка создания таблицы freekassa_payments: {e}")
+        return False
+
+
 async def create_discount_offers_table():
     table_exists = await check_table_exists('discount_offers')
     if table_exists:
@@ -1944,6 +2056,37 @@ async def ensure_user_promo_offer_discount_columns():
         return True
     except Exception as e:
         logger.error(f"Ошибка обновления колонок promo_offer_discount_*: {e}")
+        return False
+
+
+async def ensure_user_notification_settings_column() -> bool:
+    """Ensure notification_settings column exists in users table."""
+    try:
+        column_exists = await check_column_exists('users', 'notification_settings')
+
+        if column_exists:
+            return True
+
+        async with engine.begin() as conn:
+            db_type = await get_database_type()
+
+            if db_type == 'sqlite':
+                column_def = 'TEXT NULL'
+            elif db_type == 'postgresql':
+                column_def = 'JSONB NULL'
+            elif db_type == 'mysql':
+                column_def = 'JSON NULL'
+            else:
+                column_def = 'TEXT NULL'
+
+            await conn.execute(text(
+                f"ALTER TABLE users ADD COLUMN notification_settings {column_def}"
+            ))
+
+        logger.info("✅ Колонка notification_settings для users добавлена")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка добавления колонки notification_settings: {e}")
         return False
 
 
@@ -3351,6 +3494,54 @@ async def add_user_restriction_columns() -> bool:
         return False
 
 
+async def add_user_cabinet_columns() -> bool:
+    """Add cabinet (personal account) columns to users table."""
+    cabinet_columns = [
+        ("email", "VARCHAR(255)", "VARCHAR(255)", "VARCHAR(255)"),
+        ("email_verified", "BOOLEAN DEFAULT 0", "BOOLEAN DEFAULT FALSE", "TINYINT(1) DEFAULT 0"),
+        ("email_verified_at", "DATETIME", "TIMESTAMP", "DATETIME"),
+        ("password_hash", "VARCHAR(255)", "VARCHAR(255)", "VARCHAR(255)"),
+        ("email_verification_token", "VARCHAR(255)", "VARCHAR(255)", "VARCHAR(255)"),
+        ("email_verification_expires", "DATETIME", "TIMESTAMP", "DATETIME"),
+        ("password_reset_token", "VARCHAR(255)", "VARCHAR(255)", "VARCHAR(255)"),
+        ("password_reset_expires", "DATETIME", "TIMESTAMP", "DATETIME"),
+        ("cabinet_last_login", "DATETIME", "TIMESTAMP", "DATETIME"),
+    ]
+
+    try:
+        db_type = await get_database_type()
+        added_count = 0
+
+        for col_name, sqlite_type, pg_type, mysql_type in cabinet_columns:
+            if await check_column_exists('users', col_name):
+                continue
+
+            async with engine.begin() as conn:
+                if db_type == 'sqlite':
+                    col_type = sqlite_type
+                elif db_type == 'postgresql':
+                    col_type = pg_type
+                else:
+                    col_type = mysql_type
+
+                await conn.execute(
+                    text(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
+                )
+                added_count += 1
+                logger.info(f"✅ Добавлена колонка users.{col_name}")
+
+        if added_count == 0:
+            logger.info("ℹ️ Все колонки cabinet уже существуют в таблице users")
+        else:
+            logger.info(f"✅ Добавлено {added_count} колонок cabinet в таблицу users")
+
+        return True
+
+    except Exception as e:
+        logger.error(f"Ошибка добавления колонок cabinet: {e}")
+        return False
+
+
 async def add_subscription_crypto_link_column() -> bool:
     column_exists = await check_column_exists('subscriptions', 'subscription_crypto_link')
     if column_exists:
@@ -4630,6 +4821,38 @@ async def add_promocode_promo_group_column() -> bool:
         return False
 
 
+async def add_promocode_first_purchase_only_column() -> bool:
+    """Добавляет колонку first_purchase_only в таблицу promocodes."""
+    column_exists = await check_column_exists('promocodes', 'first_purchase_only')
+    if column_exists:
+        logger.info("Колонка first_purchase_only уже существует в promocodes")
+        return True
+
+    try:
+        async with engine.begin() as conn:
+            db_type = await get_database_type()
+
+            if db_type == 'sqlite':
+                await conn.execute(
+                    text("ALTER TABLE promocodes ADD COLUMN first_purchase_only BOOLEAN DEFAULT 0")
+                )
+            elif db_type == 'postgresql':
+                await conn.execute(
+                    text("ALTER TABLE promocodes ADD COLUMN first_purchase_only BOOLEAN DEFAULT FALSE")
+                )
+            elif db_type == 'mysql':
+                await conn.execute(
+                    text("ALTER TABLE promocodes ADD COLUMN first_purchase_only BOOLEAN DEFAULT FALSE")
+                )
+
+        logger.info("✅ Добавлена колонка first_purchase_only в promocodes")
+        return True
+
+    except Exception as error:
+        logger.error(f"❌ Ошибка добавления first_purchase_only в promocodes: {error}")
+        return False
+
+
 async def migrate_contest_templates_prize_columns() -> bool:
     """Миграция contest_templates: prize_days -> prize_type + prize_value."""
     try:
@@ -4826,6 +5049,203 @@ async def add_transaction_receipt_columns() -> bool:
         return False
 
 
+# =============================================================================
+# МИГРАЦИИ ДЛЯ РЕЖИМА ТАРИФОВ
+# =============================================================================
+
+async def create_tariffs_table() -> bool:
+    """Создаёт таблицу тарифов для режима продаж 'Тарифы'."""
+    try:
+        if await check_table_exists('tariffs'):
+            logger.info("ℹ️ Таблица tariffs уже существует")
+            return True
+
+        async with engine.begin() as conn:
+            db_type = await get_database_type()
+
+            if db_type == 'sqlite':
+                await conn.execute(text("""
+                CREATE TABLE tariffs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name VARCHAR(255) NOT NULL,
+                    description TEXT,
+                    display_order INTEGER DEFAULT 0 NOT NULL,
+                    is_active BOOLEAN DEFAULT 1 NOT NULL,
+                    traffic_limit_gb INTEGER DEFAULT 100 NOT NULL,
+                    device_limit INTEGER DEFAULT 1 NOT NULL,
+                    allowed_squads JSON DEFAULT '[]',
+                    period_prices JSON DEFAULT '{}' NOT NULL,
+                    tier_level INTEGER DEFAULT 1 NOT NULL,
+                    is_trial_available BOOLEAN DEFAULT 0 NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                """))
+            elif db_type == 'postgresql':
+                await conn.execute(text("""
+                CREATE TABLE tariffs (
+                    id SERIAL PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL,
+                    description TEXT,
+                    display_order INTEGER DEFAULT 0 NOT NULL,
+                    is_active BOOLEAN DEFAULT TRUE NOT NULL,
+                    traffic_limit_gb INTEGER DEFAULT 100 NOT NULL,
+                    device_limit INTEGER DEFAULT 1 NOT NULL,
+                    allowed_squads JSON DEFAULT '[]',
+                    period_prices JSON DEFAULT '{}' NOT NULL,
+                    tier_level INTEGER DEFAULT 1 NOT NULL,
+                    is_trial_available BOOLEAN DEFAULT FALSE NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+                """))
+            else:  # MySQL
+                await conn.execute(text("""
+                CREATE TABLE tariffs (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL,
+                    description TEXT,
+                    display_order INT DEFAULT 0 NOT NULL,
+                    is_active BOOLEAN DEFAULT TRUE NOT NULL,
+                    traffic_limit_gb INT DEFAULT 100 NOT NULL,
+                    device_limit INT DEFAULT 1 NOT NULL,
+                    allowed_squads JSON DEFAULT (JSON_ARRAY()),
+                    period_prices JSON NOT NULL,
+                    tier_level INT DEFAULT 1 NOT NULL,
+                    is_trial_available BOOLEAN DEFAULT FALSE NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                )
+                """))
+
+            logger.info("✅ Таблица tariffs создана")
+            return True
+
+    except Exception as error:
+        logger.error(f"❌ Ошибка создания таблицы tariffs: {error}")
+        return False
+
+
+async def create_tariff_promo_groups_table() -> bool:
+    """Создаёт связующую таблицу tariff_promo_groups для M2M связи тарифов и промогрупп."""
+    try:
+        if await check_table_exists('tariff_promo_groups'):
+            logger.info("ℹ️ Таблица tariff_promo_groups уже существует")
+            return True
+
+        async with engine.begin() as conn:
+            db_type = await get_database_type()
+
+            if db_type == 'sqlite':
+                await conn.execute(text("""
+                CREATE TABLE tariff_promo_groups (
+                    tariff_id INTEGER NOT NULL,
+                    promo_group_id INTEGER NOT NULL,
+                    PRIMARY KEY (tariff_id, promo_group_id),
+                    FOREIGN KEY (tariff_id) REFERENCES tariffs(id) ON DELETE CASCADE,
+                    FOREIGN KEY (promo_group_id) REFERENCES promo_groups(id) ON DELETE CASCADE
+                )
+                """))
+            elif db_type == 'postgresql':
+                await conn.execute(text("""
+                CREATE TABLE tariff_promo_groups (
+                    tariff_id INTEGER NOT NULL REFERENCES tariffs(id) ON DELETE CASCADE,
+                    promo_group_id INTEGER NOT NULL REFERENCES promo_groups(id) ON DELETE CASCADE,
+                    PRIMARY KEY (tariff_id, promo_group_id)
+                )
+                """))
+            else:  # MySQL
+                await conn.execute(text("""
+                CREATE TABLE tariff_promo_groups (
+                    tariff_id INT NOT NULL,
+                    promo_group_id INT NOT NULL,
+                    PRIMARY KEY (tariff_id, promo_group_id),
+                    FOREIGN KEY (tariff_id) REFERENCES tariffs(id) ON DELETE CASCADE,
+                    FOREIGN KEY (promo_group_id) REFERENCES promo_groups(id) ON DELETE CASCADE
+                )
+                """))
+
+            logger.info("✅ Таблица tariff_promo_groups создана")
+            return True
+
+    except Exception as error:
+        logger.error(f"❌ Ошибка создания таблицы tariff_promo_groups: {error}")
+        return False
+
+
+async def add_subscription_tariff_id_column() -> bool:
+    """Добавляет колонку tariff_id в таблицу subscriptions."""
+    try:
+        if await check_column_exists('subscriptions', 'tariff_id'):
+            logger.info("ℹ️ Колонка tariff_id уже существует в subscriptions")
+            return True
+
+        async with engine.begin() as conn:
+            db_type = await get_database_type()
+
+            if db_type == 'sqlite':
+                await conn.execute(text(
+                    "ALTER TABLE subscriptions ADD COLUMN tariff_id INTEGER REFERENCES tariffs(id)"
+                ))
+            elif db_type == 'postgresql':
+                await conn.execute(text(
+                    "ALTER TABLE subscriptions ADD COLUMN tariff_id INTEGER REFERENCES tariffs(id) ON DELETE SET NULL"
+                ))
+                # Создаём индекс
+                await conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_subscriptions_tariff_id ON subscriptions(tariff_id)"
+                ))
+            else:  # MySQL
+                await conn.execute(text(
+                    "ALTER TABLE subscriptions ADD COLUMN tariff_id INT NULL"
+                ))
+                await conn.execute(text(
+                    "ALTER TABLE subscriptions ADD CONSTRAINT fk_subscriptions_tariff "
+                    "FOREIGN KEY (tariff_id) REFERENCES tariffs(id) ON DELETE SET NULL"
+                ))
+                await conn.execute(text(
+                    "CREATE INDEX ix_subscriptions_tariff_id ON subscriptions(tariff_id)"
+                ))
+
+            logger.info("✅ Колонка tariff_id добавлена в subscriptions")
+            return True
+
+    except Exception as error:
+        logger.error(f"❌ Ошибка добавления колонки tariff_id: {error}")
+        return False
+
+
+async def add_tariff_device_price_column() -> bool:
+    """Добавляет колонку device_price_kopeks в таблицу tariffs."""
+    try:
+        if await check_column_exists('tariffs', 'device_price_kopeks'):
+            logger.info("ℹ️ Колонка device_price_kopeks уже существует в tariffs")
+            return True
+
+        async with engine.begin() as conn:
+            db_type = await get_database_type()
+
+            if db_type == 'sqlite':
+                await conn.execute(text(
+                    "ALTER TABLE tariffs ADD COLUMN device_price_kopeks INTEGER DEFAULT NULL"
+                ))
+            elif db_type == 'postgresql':
+                await conn.execute(text(
+                    "ALTER TABLE tariffs ADD COLUMN device_price_kopeks INTEGER DEFAULT NULL"
+                ))
+            else:  # MySQL
+                await conn.execute(text(
+                    "ALTER TABLE tariffs ADD COLUMN device_price_kopeks INT DEFAULT NULL"
+                ))
+
+            logger.info("✅ Колонка device_price_kopeks добавлена в tariffs")
+            return True
+
+    except Exception as error:
+        logger.error(f"❌ Ошибка добавления колонки device_price_kopeks: {error}")
+        return False
+
+
 async def run_universal_migration():
     logger.info("=== НАЧАЛО УНИВЕРСАЛЬНОЙ МИГРАЦИИ ===")
     
@@ -4969,6 +5389,13 @@ async def run_universal_migration():
         else:
             logger.warning("⚠️ Не удалось обновить схему Wata payments")
 
+        logger.info("=== СОЗДАНИЕ ТАБЛИЦЫ FREEKASSA ===")
+        freekassa_created = await create_freekassa_payments_table()
+        if freekassa_created:
+            logger.info("✅ Таблица Freekassa payments готова")
+        else:
+            logger.warning("⚠️ Проблемы с таблицей Freekassa payments")
+
         logger.info("=== СОЗДАНИЕ ТАБЛИЦЫ DISCOUNT_OFFERS ===")
         discount_created = await create_discount_offers_table()
         if discount_created:
@@ -5038,6 +5465,13 @@ async def run_universal_migration():
         else:
             logger.warning("⚠️ Не удалось обновить пользовательские промо-скидки")
 
+        logger.info("=== ДОБАВЛЕНИЕ КОЛОНКИ NOTIFICATION_SETTINGS ===")
+        notification_settings_ready = await ensure_user_notification_settings_column()
+        if notification_settings_ready:
+            logger.info("✅ Колонка notification_settings готова")
+        else:
+            logger.warning("⚠️ Не удалось добавить колонку notification_settings")
+
         effect_types_updated = await migrate_discount_offer_effect_types()
         if effect_types_updated:
             logger.info("✅ Типы эффектов промо-предложений обновлены")
@@ -5084,6 +5518,13 @@ async def run_universal_migration():
             logger.info("✅ Колонка promo_group_id в promocodes готова")
         else:
             logger.warning("⚠️ Проблемы с добавлением promo_group_id в promocodes")
+
+        logger.info("=== ДОБАВЛЕНИЕ FIRST_PURCHASE_ONLY В PROMOCODES ===")
+        first_purchase_ready = await add_promocode_first_purchase_only_column()
+        if first_purchase_ready:
+            logger.info("✅ Колонка first_purchase_only в promocodes готова")
+        else:
+            logger.warning("⚠️ Проблемы с добавлением first_purchase_only в promocodes")
 
         logger.info("=== СОЗДАНИЕ ТАБЛИЦЫ MAIN_MENU_BUTTONS ===")
         main_menu_buttons_created = await create_main_menu_buttons_table()
@@ -5196,6 +5637,13 @@ async def run_universal_migration():
         else:
             logger.warning("⚠️ Проблемы с добавлением колонок ограничений пользователей")
 
+        logger.info("=== ДОБАВЛЕНИЕ КОЛОНОК ЛИЧНОГО КАБИНЕТА ===")
+        cabinet_added = await add_user_cabinet_columns()
+        if cabinet_added:
+            logger.info("✅ Колонки личного кабинета готовы")
+        else:
+            logger.warning("⚠️ Проблемы с добавлением колонок личного кабинета")
+
         logger.info("=== СОЗДАНИЕ ТАБЛИЦЫ АУДИТА ПОДДЕРЖКИ ===")
         try:
             async with engine.begin() as conn:
@@ -5274,6 +5722,31 @@ async def run_universal_migration():
             logger.info("✅ Доступ серверов по промогруппам настроен")
         else:
             logger.warning("⚠️ Проблемы с настройкой доступа серверов к промогруппам")
+
+        logger.info("=== СОЗДАНИЕ ТАБЛИЦ ДЛЯ РЕЖИМА ТАРИФОВ ===")
+        tariffs_table_ready = await create_tariffs_table()
+        if tariffs_table_ready:
+            logger.info("✅ Таблица tariffs готова")
+        else:
+            logger.warning("⚠️ Проблемы с таблицей tariffs")
+
+        tariff_promo_groups_ready = await create_tariff_promo_groups_table()
+        if tariff_promo_groups_ready:
+            logger.info("✅ Таблица tariff_promo_groups готова")
+        else:
+            logger.warning("⚠️ Проблемы с таблицей tariff_promo_groups")
+
+        tariff_id_column_ready = await add_subscription_tariff_id_column()
+        if tariff_id_column_ready:
+            logger.info("✅ Колонка tariff_id в subscriptions готова")
+        else:
+            logger.warning("⚠️ Проблемы с колонкой tariff_id в subscriptions")
+
+        device_price_column_ready = await add_tariff_device_price_column()
+        if device_price_column_ready:
+            logger.info("✅ Колонка device_price_kopeks в tariffs готова")
+        else:
+            logger.warning("⚠️ Проблемы с колонкой device_price_kopeks в tariffs")
 
         logger.info("=== ОБНОВЛЕНИЕ ВНЕШНИХ КЛЮЧЕЙ ===")
         fk_updated = await fix_foreign_keys_for_user_deletion()
@@ -5384,6 +5857,7 @@ async def check_migration_status():
             "users_promo_offer_discount_source_column": False,
             "users_promo_offer_discount_expires_column": False,
             "users_referral_commission_percent_column": False,
+            "users_notification_settings_column": False,
             "subscription_crypto_link_column": False,
             "subscription_modem_enabled_column": False,
             "subscription_purchased_traffic_column": False,
@@ -5451,6 +5925,7 @@ async def check_migration_status():
         status["users_promo_offer_discount_source_column"] = await check_column_exists('users', 'promo_offer_discount_source')
         status["users_promo_offer_discount_expires_column"] = await check_column_exists('users', 'promo_offer_discount_expires_at')
         status["users_referral_commission_percent_column"] = await check_column_exists('users', 'referral_commission_percent')
+        status["users_notification_settings_column"] = await check_column_exists('users', 'notification_settings')
         status["subscription_crypto_link_column"] = await check_column_exists('subscriptions', 'subscription_crypto_link')
         status["subscription_modem_enabled_column"] = await check_column_exists('subscriptions', 'modem_enabled')
         status["subscription_purchased_traffic_column"] = await check_column_exists('subscriptions', 'purchased_traffic_gb')
@@ -5534,6 +6009,7 @@ async def check_migration_status():
             "users_promo_offer_discount_source_column": "Колонка источника промо-скидки у пользователей",
             "users_promo_offer_discount_expires_column": "Колонка срока действия промо-скидки у пользователей",
             "users_referral_commission_percent_column": "Колонка процента реферальной комиссии у пользователей",
+            "users_notification_settings_column": "Колонка notification_settings у пользователей",
             "subscription_crypto_link_column": "Колонка subscription_crypto_link в subscriptions",
             "subscription_modem_enabled_column": "Колонка modem_enabled в subscriptions",
             "subscription_purchased_traffic_column": "Колонка purchased_traffic_gb в subscriptions",

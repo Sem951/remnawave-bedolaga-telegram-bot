@@ -166,7 +166,17 @@ class Settings(BaseSettings):
     TRAFFIC_SELECTION_MODE: str = "selectable"
     FIXED_TRAFFIC_LIMIT_GB: int = 100
     BUY_TRAFFIC_BUTTON_VISIBLE: bool = True
-    
+
+    # Режим продаж подписок:
+    # - classic: классический режим (выбор серверов, трафика, устройств, периода отдельно)
+    # - tariffs: режим тарифов (готовые пакеты с фиксированными параметрами)
+    SALES_MODE: str = "classic"
+
+    # ID тарифа для триала в режиме тарифов (0 = использовать стандартные настройки триала)
+    # Если указан ID тарифа, параметры триала берутся из тарифа (traffic_limit_gb, device_limit, allowed_squads)
+    # Длительность триала всё равно берётся из TRIAL_DURATION_DAYS
+    TRIAL_TARIFF_ID: int = 0
+
     # Настройки докупки трафика
     TRAFFIC_TOPUP_ENABLED: bool = True  # Включить/выключить функцию докупки трафика
     # Пакеты для докупки трафика (формат: "гб:цена:enabled", пустая строка = использовать TRAFFIC_PACKAGES_CONFIG)
@@ -399,6 +409,21 @@ class Settings(BaseSettings):
     CLOUDPAYMENTS_REQUIRE_EMAIL: bool = False
     CLOUDPAYMENTS_TEST_MODE: bool = False
 
+    # Freekassa
+    FREEKASSA_ENABLED: bool = False
+    FREEKASSA_SHOP_ID: Optional[int] = None
+    FREEKASSA_API_KEY: Optional[str] = None
+    FREEKASSA_SECRET_WORD_1: Optional[str] = None  # Для формы оплаты
+    FREEKASSA_SECRET_WORD_2: Optional[str] = None  # Для webhook
+    FREEKASSA_DISPLAY_NAME: str = "Freekassa"
+    FREEKASSA_CURRENCY: str = "RUB"
+    FREEKASSA_MIN_AMOUNT_KOPEKS: int = 10000  # 100 руб
+    FREEKASSA_MAX_AMOUNT_KOPEKS: int = 100000000  # 1 000 000 руб
+    FREEKASSA_PAYMENT_TIMEOUT_SECONDS: int = 3600
+    FREEKASSA_WEBHOOK_PATH: str = "/freekassa-webhook"
+    FREEKASSA_WEBHOOK_HOST: str = "0.0.0.0"
+    FREEKASSA_WEBHOOK_PORT: int = 8088
+
     MAIN_MENU_MODE: str = "default"
     CONNECT_BUTTON_MODE: str = "guide"
     MINIAPP_CUSTOM_URL: str = ""
@@ -493,6 +518,25 @@ class Settings(BaseSettings):
 
     EXTERNAL_ADMIN_TOKEN: Optional[str] = None
     EXTERNAL_ADMIN_TOKEN_BOT_ID: Optional[int] = None
+
+    # Cabinet (Personal Account) settings
+    CABINET_ENABLED: bool = False
+    CABINET_JWT_SECRET: Optional[str] = None
+    CABINET_ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
+    CABINET_REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    CABINET_ALLOWED_ORIGINS: str = ""
+    CABINET_EMAIL_VERIFICATION_ENABLED: bool = True
+    CABINET_EMAIL_VERIFICATION_EXPIRE_HOURS: int = 24
+    CABINET_PASSWORD_RESET_EXPIRE_HOURS: int = 1
+
+    # SMTP settings for cabinet email
+    SMTP_HOST: Optional[str] = None
+    SMTP_PORT: int = 587
+    SMTP_USER: Optional[str] = None
+    SMTP_PASSWORD: Optional[str] = None
+    SMTP_FROM_EMAIL: Optional[str] = None
+    SMTP_FROM_NAME: str = "VPN Service"
+    SMTP_USE_TLS: bool = True
 
     @field_validator('MAIN_MENU_MODE', mode='before')
     @classmethod
@@ -1157,6 +1201,22 @@ class Settings(BaseSettings):
     def is_modem_enabled(self) -> bool:
         return bool(self.MODEM_ENABLED)
 
+    def is_tariffs_mode(self) -> bool:
+        """Проверяет, включен ли режим продаж 'Тарифы'."""
+        return self.SALES_MODE == "tariffs"
+
+    def is_classic_mode(self) -> bool:
+        """Проверяет, включен ли классический режим продаж."""
+        return self.SALES_MODE != "tariffs"
+
+    def get_sales_mode(self) -> str:
+        """Возвращает текущий режим продаж."""
+        return self.SALES_MODE if self.SALES_MODE in ("classic", "tariffs") else "classic"
+
+    def get_trial_tariff_id(self) -> int:
+        """Возвращает ID тарифа для триала (0 = использовать стандартные настройки)."""
+        return self.TRIAL_TARIFF_ID if self.TRIAL_TARIFF_ID > 0 else 0
+
     def get_modem_price_per_month(self) -> int:
         try:
             value = int(self.MODEM_PRICE_PER_MONTH)
@@ -1214,11 +1274,12 @@ class Settings(BaseSettings):
         return applicable_discount
 
     def is_trial_paid_activation_enabled(self) -> bool:
-        # Если цена > 0, триал автоматически платный
-        # (TRIAL_PAYMENT_ENABLED теперь опционален - для обратной совместимости)
-        if self.TRIAL_ACTIVATION_PRICE > 0:
-            return True
-        return bool(self.TRIAL_PAYMENT_ENABLED)
+        # TRIAL_PAYMENT_ENABLED - главный переключатель платной активации
+        # Если выключен - триал бесплатный, независимо от цены
+        if not self.TRIAL_PAYMENT_ENABLED:
+            return False
+        # Если включен - проверяем что цена > 0
+        return self.TRIAL_ACTIVATION_PRICE > 0
 
     def get_trial_activation_price(self) -> int:
         try:
@@ -1394,6 +1455,22 @@ class Settings(BaseSettings):
             and self.CLOUDPAYMENTS_PUBLIC_ID is not None
             and self.CLOUDPAYMENTS_API_SECRET is not None
         )
+
+    def is_freekassa_enabled(self) -> bool:
+        return (
+            self.FREEKASSA_ENABLED
+            and self.FREEKASSA_SHOP_ID is not None
+            and self.FREEKASSA_API_KEY is not None
+            and self.FREEKASSA_SECRET_WORD_1 is not None
+            and self.FREEKASSA_SECRET_WORD_2 is not None
+        )
+
+    def get_freekassa_display_name(self) -> str:
+        name = (self.FREEKASSA_DISPLAY_NAME or "").strip()
+        return name if name else "Freekassa"
+
+    def get_freekassa_display_name_html(self) -> str:
+        return html.escape(self.get_freekassa_display_name())
 
     def is_payment_verification_auto_check_enabled(self) -> bool:
         return self.PAYMENT_VERIFICATION_AUTO_CHECK_ENABLED
@@ -1627,7 +1704,10 @@ class Settings(BaseSettings):
         return stars * self.get_stars_rate()
     
     def rubles_to_stars(self, rubles: float) -> int:
-        return max(1, math.ceil(rubles / self.get_stars_rate()))
+        rate = self.get_stars_rate()
+        if rate <= 0:
+            raise ValueError("Stars rate must be positive")
+        return max(1, math.ceil(rubles / rate))
 
     def get_admin_notifications_chat_id(self) -> Optional[int]:
         if not self.ADMIN_NOTIFICATIONS_CHAT_ID:
@@ -2009,6 +2089,43 @@ class Settings(BaseSettings):
         if not raw_path:
             raw_path = "miniapp"
         return Path(raw_path)
+
+    # Cabinet methods
+    def is_cabinet_enabled(self) -> bool:
+        return bool(self.CABINET_ENABLED)
+
+    def get_cabinet_jwt_secret(self) -> str:
+        if self.CABINET_JWT_SECRET:
+            return self.CABINET_JWT_SECRET
+        return self.BOT_TOKEN
+
+    def get_cabinet_access_token_expire_minutes(self) -> int:
+        return max(1, self.CABINET_ACCESS_TOKEN_EXPIRE_MINUTES)
+
+    def get_cabinet_refresh_token_expire_days(self) -> int:
+        return max(1, self.CABINET_REFRESH_TOKEN_EXPIRE_DAYS)
+
+    def get_cabinet_allowed_origins(self) -> List[str]:
+        if not self.CABINET_ALLOWED_ORIGINS:
+            return []
+        return [o.strip() for o in self.CABINET_ALLOWED_ORIGINS.split(",") if o.strip()]
+
+    def is_cabinet_email_verification_enabled(self) -> bool:
+        return bool(self.CABINET_EMAIL_VERIFICATION_ENABLED)
+
+    def get_cabinet_email_verification_expire_hours(self) -> int:
+        return max(1, self.CABINET_EMAIL_VERIFICATION_EXPIRE_HOURS)
+
+    def get_cabinet_password_reset_expire_hours(self) -> int:
+        return max(1, self.CABINET_PASSWORD_RESET_EXPIRE_HOURS)
+
+    def is_smtp_configured(self) -> bool:
+        return bool(self.SMTP_HOST and self.SMTP_USER and self.SMTP_PASSWORD)
+
+    def get_smtp_from_email(self) -> Optional[str]:
+        if self.SMTP_FROM_EMAIL:
+            return self.SMTP_FROM_EMAIL
+        return self.SMTP_USER
 
     model_config = {
         "env_file": ".env",

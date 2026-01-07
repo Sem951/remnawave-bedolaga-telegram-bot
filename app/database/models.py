@@ -46,6 +46,25 @@ server_squad_promo_groups = Table(
 )
 
 
+# M2M таблица для связи тарифов с промогруппами (доступ к тарифу)
+tariff_promo_groups = Table(
+    "tariff_promo_groups",
+    Base.metadata,
+    Column(
+        "tariff_id",
+        Integer,
+        ForeignKey("tariffs.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "promo_group_id",
+        Integer,
+        ForeignKey("promo_groups.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+)
+
+
 class UserStatus(Enum):
     ACTIVE = "active"
     BLOCKED = "blocked"
@@ -87,6 +106,7 @@ class PaymentMethod(Enum):
     WATA = "wata"
     PLATEGA = "platega"
     CLOUDPAYMENTS = "cloudpayments"
+    FREEKASSA = "freekassa"
     MANUAL = "manual"
 
 
@@ -545,6 +565,73 @@ class CloudPaymentsPayment(Base):
         )
 
 
+class FreekassaPayment(Base):
+    __tablename__ = "freekassa_payments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    # Идентификаторы
+    order_id = Column(String(64), unique=True, nullable=False, index=True)  # Наш ID заказа
+    freekassa_order_id = Column(String(64), unique=True, nullable=True, index=True)  # intid от Freekassa
+
+    # Суммы
+    amount_kopeks = Column(Integer, nullable=False)
+    currency = Column(String(10), nullable=False, default="RUB")
+    description = Column(Text, nullable=True)
+
+    # Статусы
+    status = Column(String(32), nullable=False, default="pending")  # pending, success, failed, expired
+    is_paid = Column(Boolean, default=False)
+
+    # Данные платежа
+    payment_url = Column(Text, nullable=True)
+    payment_system_id = Column(Integer, nullable=True)  # ID платежной системы FK
+
+    # Метаданные
+    metadata_json = Column(JSON, nullable=True)
+    callback_payload = Column(JSON, nullable=True)
+
+    # Временные метки
+    paid_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    # Связь с транзакцией
+    transaction_id = Column(Integer, ForeignKey("transactions.id"), nullable=True)
+
+    # Relationships
+    user = relationship("User", backref="freekassa_payments")
+    transaction = relationship("Transaction", backref="freekassa_payment")
+
+    @property
+    def amount_rubles(self) -> float:
+        return self.amount_kopeks / 100
+
+    @property
+    def is_pending(self) -> bool:
+        return self.status == "pending"
+
+    @property
+    def is_success(self) -> bool:
+        return self.status == "success" and self.is_paid
+
+    @property
+    def is_failed(self) -> bool:
+        return self.status in ["failed", "expired"]
+
+    def __repr__(self) -> str:  # pragma: no cover - debug helper
+        return (
+            "<FreekassaPayment(id={0}, order_id={1}, amount={2}₽, status={3})>".format(
+                self.id,
+                self.order_id,
+                self.amount_rubles,
+                self.status,
+            )
+        )
+
+
 class PromoGroup(Base):
     __tablename__ = "promo_groups"
 
@@ -646,6 +733,82 @@ class UserPromoGroup(Base):
         return f"<UserPromoGroup(user_id={self.user_id}, promo_group_id={self.promo_group_id}, assigned_by='{self.assigned_by}')>"
 
 
+class Tariff(Base):
+    """Тарифный план для режима продаж 'Тарифы'."""
+    __tablename__ = "tariffs"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Основная информация
+    name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    display_order = Column(Integer, default=0, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+
+    # Параметры тарифа
+    traffic_limit_gb = Column(Integer, nullable=False, default=100)  # 0 = безлимит
+    device_limit = Column(Integer, nullable=False, default=1)
+    device_price_kopeks = Column(Integer, nullable=True, default=None)  # Цена за доп. устройство (None = нельзя докупить)
+
+    # Сквады (серверы) доступные в тарифе
+    allowed_squads = Column(JSON, default=list)  # список UUID сквадов
+
+    # Цены на периоды в копейках (JSON: {"14": 30000, "30": 50000, "90": 120000, ...})
+    period_prices = Column(JSON, nullable=False, default=dict)
+
+    # Уровень тарифа (для визуального отображения, 1 = базовый)
+    tier_level = Column(Integer, default=1, nullable=False)
+
+    # Дополнительные настройки
+    is_trial_available = Column(Boolean, default=False, nullable=False)  # Можно ли взять триал на этом тарифе
+
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    # M2M связь с промогруппами (какие промогруппы имеют доступ к тарифу)
+    allowed_promo_groups = relationship(
+        "PromoGroup",
+        secondary=tariff_promo_groups,
+        lazy="selectin",
+    )
+
+    # Подписки на этом тарифе
+    subscriptions = relationship("Subscription", back_populates="tariff")
+
+    @property
+    def is_unlimited_traffic(self) -> bool:
+        """Проверяет, безлимитный ли трафик."""
+        return self.traffic_limit_gb == 0
+
+    def get_price_for_period(self, period_days: int) -> Optional[int]:
+        """Возвращает цену в копейках для указанного периода."""
+        prices = self.period_prices or {}
+        return prices.get(str(period_days))
+
+    def get_available_periods(self) -> List[int]:
+        """Возвращает список доступных периодов в днях."""
+        prices = self.period_prices or {}
+        return sorted([int(p) for p in prices.keys()])
+
+    def get_price_rubles(self, period_days: int) -> Optional[float]:
+        """Возвращает цену в рублях для указанного периода."""
+        price_kopeks = self.get_price_for_period(period_days)
+        if price_kopeks is not None:
+            return price_kopeks / 100
+        return None
+
+    def is_available_for_promo_group(self, promo_group_id: Optional[int]) -> bool:
+        """Проверяет, доступен ли тариф для указанной промогруппы."""
+        if not self.allowed_promo_groups:
+            return True  # Если нет ограничений - доступен всем
+        if promo_group_id is None:
+            return True  # Если у пользователя нет группы - доступен
+        return any(pg.id == promo_group_id for pg in self.allowed_promo_groups)
+
+    def __repr__(self):
+        return f"<Tariff(id={self.id}, name='{self.name}', tier={self.tier_level}, active={self.is_active})>"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -657,7 +820,7 @@ class User(Base):
     status = Column(String(20), default=UserStatus.ACTIVE.value)
     language = Column(String(5), default="ru")
     balance_kopeks = Column(Integer, default=0)
-    used_promocodes = Column(Integer, default=0) 
+    used_promocodes = Column(Integer, default=0)
     has_had_paid_subscription = Column(Boolean, default=False, nullable=False)
     referred_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     referral_code = Column(String(20), unique=True, nullable=True)
@@ -665,6 +828,17 @@ class User(Base):
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
     last_activity = Column(DateTime, default=func.now())
     remnawave_uuid = Column(String(255), nullable=True, unique=True)
+
+    # Cabinet authentication fields
+    email = Column(String(255), unique=True, nullable=True, index=True)
+    email_verified = Column(Boolean, default=False, nullable=False)
+    email_verified_at = Column(DateTime, nullable=True)
+    password_hash = Column(String(255), nullable=True)
+    email_verification_token = Column(String(255), nullable=True)
+    email_verification_expires = Column(DateTime, nullable=True)
+    password_reset_token = Column(String(255), nullable=True)
+    password_reset_expires = Column(DateTime, nullable=True)
+    cabinet_last_login = Column(DateTime, nullable=True)
     broadcasts = relationship("BroadcastHistory", back_populates="admin")
     referrals = relationship("User", backref="referrer", remote_side=[id], foreign_keys="User.referred_by_id")
     subscription = relationship("Subscription", back_populates="user", uselist=False)
@@ -688,6 +862,7 @@ class User(Base):
     promo_group = relationship("PromoGroup", back_populates="users")
     user_promo_groups = relationship("UserPromoGroup", back_populates="user", cascade="all, delete-orphan")
     poll_responses = relationship("PollResponse", back_populates="user")
+    notification_settings = Column(JSON, nullable=True, default=dict)
     last_pinned_message_id = Column(Integer, nullable=True)
 
     # Ограничения пользователя
@@ -780,10 +955,14 @@ class Subscription(Base):
     
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
-    
+
     remnawave_short_uuid = Column(String(255), nullable=True)
 
+    # Тариф (для режима продаж "Тарифы")
+    tariff_id = Column(Integer, ForeignKey("tariffs.id", ondelete="SET NULL"), nullable=True, index=True)
+
     user = relationship("User", back_populates="subscription")
+    tariff = relationship("Tariff", back_populates="subscriptions")
     discount_offers = relationship("DiscountOffer", back_populates="subscription")
     temporary_accesses = relationship("SubscriptionTemporaryAccess", back_populates="subscription")
     
@@ -993,6 +1172,7 @@ class PromoCode(Base):
     valid_until = Column(DateTime, nullable=True)
     
     is_active = Column(Boolean, default=True)
+    first_purchase_only = Column(Boolean, default=False)  # Только для первой покупки
 
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     promo_group_id = Column(Integer, ForeignKey("promo_groups.id", ondelete="SET NULL"), nullable=True, index=True)
@@ -1939,3 +2119,92 @@ class ButtonClickLog(Base):
 
     def __repr__(self) -> str:
         return f"<ButtonClickLog id={self.id} button='{self.button_id}' user={self.user_id} at={self.clicked_at}>"
+
+
+class Webhook(Base):
+    """Webhook конфигурация для подписки на события."""
+    __tablename__ = "webhooks"
+    __table_args__ = (
+        Index("ix_webhooks_event_type", "event_type"),
+        Index("ix_webhooks_is_active", "is_active"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(255), nullable=False)
+    url = Column(Text, nullable=False)
+    secret = Column(String(128), nullable=True)  # Секрет для подписи payload
+    event_type = Column(String(50), nullable=False)  # user.created, payment.completed, ticket.created, etc.
+    is_active = Column(Boolean, default=True, nullable=False)
+    description = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    last_triggered_at = Column(DateTime, nullable=True)
+    failure_count = Column(Integer, default=0, nullable=False)
+    success_count = Column(Integer, default=0, nullable=False)
+
+    deliveries = relationship("WebhookDelivery", back_populates="webhook", cascade="all, delete-orphan")
+
+    def __repr__(self) -> str:
+        status = "active" if self.is_active else "inactive"
+        return f"<Webhook id={self.id} name='{self.name}' event='{self.event_type}' status={status}>"
+
+
+class WebhookDelivery(Base):
+    """История доставки webhooks."""
+    __tablename__ = "webhook_deliveries"
+    __table_args__ = (
+        Index("ix_webhook_deliveries_webhook_created", "webhook_id", "created_at"),
+        Index("ix_webhook_deliveries_status", "status"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    webhook_id = Column(Integer, ForeignKey("webhooks.id", ondelete="CASCADE"), nullable=False)
+    event_type = Column(String(50), nullable=False)
+    payload = Column(JSON, nullable=False)  # Отправленный payload
+    response_status = Column(Integer, nullable=True)  # HTTP статус ответа
+    response_body = Column(Text, nullable=True)  # Тело ответа (может быть обрезано)
+    status = Column(String(20), nullable=False)  # pending, success, failed
+    error_message = Column(Text, nullable=True)
+    attempt_number = Column(Integer, default=1, nullable=False)
+    created_at = Column(DateTime, default=func.now())
+    delivered_at = Column(DateTime, nullable=True)
+    next_retry_at = Column(DateTime, nullable=True)
+
+    webhook = relationship("Webhook", back_populates="deliveries")
+
+    def __repr__(self) -> str:
+        return f"<WebhookDelivery id={self.id} webhook_id={self.webhook_id} status='{self.status}' event='{self.event_type}'>"
+
+
+class CabinetRefreshToken(Base):
+    """Refresh tokens for cabinet JWT authentication."""
+    __tablename__ = "cabinet_refresh_tokens"
+    __table_args__ = (
+        Index("ix_cabinet_refresh_tokens_user", "user_id"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    token_hash = Column(String(255), unique=True, nullable=False, index=True)
+    device_info = Column(String(500), nullable=True)
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=func.now())
+    revoked_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", backref="cabinet_tokens")
+
+    @property
+    def is_expired(self) -> bool:
+        return datetime.utcnow() > self.expires_at
+
+    @property
+    def is_revoked(self) -> bool:
+        return self.revoked_at is not None
+
+    @property
+    def is_valid(self) -> bool:
+        return not self.is_expired and not self.is_revoked
+
+    def __repr__(self) -> str:
+        status = "valid" if self.is_valid else ("revoked" if self.is_revoked else "expired")
+        return f"<CabinetRefreshToken id={self.id} user_id={self.user_id} status={status}>"
